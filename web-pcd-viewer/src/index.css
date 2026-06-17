@@ -1,0 +1,54 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color: #e2e8f0;
+  background: #020817;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  min-width: 320px;
+  background:
+    radial-gradient(circle at top, rgba(34, 211, 238, 0.16), transparent 30%),
+    linear-gradient(180deg, #020617 0%, #020817 45%, #01040d 100%);
+}
+
+button,
+input {
+  font: inherit;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 16px;
+  width: 16px;
+  border-radius: 9999px;
+  background: #67e8f9;
+  border: 2px solid #0f172a;
+  box-shadow: 0 0 0 4px rgba(103, 232, 249, 0.2);
+}
+
+input[type="range"]::-moz-range-thumb {
+  height: 16px;
+  width: 16px;
+  border-radius: 9999px;
+  background: #67e8f9;
+  border: 2px solid #0f172a;
+  box-shadow: 0 0 0 4px rgba(103, 232, 249, 0.2);
+}

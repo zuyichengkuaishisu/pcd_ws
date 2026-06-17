@@ -1,0 +1,9 @@
+.node/
+.npm-cache/
+.npm-home/
+
+web-pcd-viewer/node_modules/
+web-pcd-viewer/dist/
+
+*.pyc
+__pycache__/
