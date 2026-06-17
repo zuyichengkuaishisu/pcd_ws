@@ -65,7 +65,7 @@ sudo usermod -aG docker $USER
 ```bash
 # 克隆仓库
 git clone <你的仓库地址>
-cd pcd_ws
+cd open-inspection-platform
 
 # 复制配置文件，按需修改机器人地址
 cp .env.example .env
@@ -203,7 +203,7 @@ export M20_MAPPING_PORT=30100
 ## 目录结构
 
 ```
-pcd_ws/
+open-inspection-platform/
 ├── web-pcd-viewer/          # 主前端工程
 │   ├── src/
 │   │   ├── pages/Home.tsx           # 主页面与控制逻辑
