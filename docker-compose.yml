@@ -1,0 +1,16 @@
+services:
+  open-inspection-platform:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: open-inspection-platform:latest
+    container_name: open-inspection-platform
+    ports:
+      - "${APP_PORT:-4174}:4174"
+    environment:
+      M20_ROBOT_HOST: "${M20_ROBOT_HOST:-10.21.31.103}"
+      M20_ROBOT_PORT: "${M20_ROBOT_PORT:-30001}"
+      M20_MAPPING_HOST: "${M20_MAPPING_HOST:-10.21.33.106}"
+      M20_MAPPING_PORT: "${M20_MAPPING_PORT:-30100}"
+      M20_DEFAULT_MAP_ASSET_NAME: "${M20_DEFAULT_MAP_ASSET_NAME:-siteB-20260616-105415}"
+    restart: unless-stopped

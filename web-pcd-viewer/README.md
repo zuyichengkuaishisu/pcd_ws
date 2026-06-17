@@ -6,7 +6,7 @@
 
 ## 为什么自己重做
 
-这个前端不是为了“做一个页面”而做的，而是因为我实在受不了很多机器人项目里前后端和业务流程的低效协作。
+这个前端不是为了"做一个页面"而做的，而是因为我实在受不了很多机器人项目里前后端和业务流程的低效协作。
 
 最典型的问题是：
 
@@ -39,29 +39,19 @@
 - 手动发布 `2101 / 1` 初始位姿
 - 长按拖动添加任务点并写入方向
 - 支持过渡点、任务点、充电点
-- 每个任务点可独立配置：
-  - 步态
-  - 速度
-  - 运动方式
-  - 停避障
-  - 导航方式
+- 每个任务点可独立配置：步态、速度、运动方式、停避障、导航方式
 - 顺序真实下发 `1003 / 1`
 - 查询 `1007 / 1` 并显示中文导航状态栏
-- 手动开始充电 / 结束充电
+- 手动开始充电 / 结束充电（`Charge=0/1`）
 - 自动处理充电点到达后的开始充电逻辑
-- 接入建图 UDP 网关：
-  - 开始建图
-  - 停止建图并保存
-  - 查询状态
-  - 列出本地地图
-  - 切换导航地图
+- 接入建图 UDP 网关：开始建图、停止保存、查询状态、列出本地地图、切换导航地图
 
 ## 页面结构
 
 - 左侧控制栏
-  - 显示点云状态、PCD 地图切换、楼层分割、机器人定位、建图控制、任务点编辑、任务点列表、任务预览、初始位姿和充电控制
+  - 点云状态、PCD 地图切换、楼层分割、机器人定位、建图控制、任务点编辑、任务点列表、任务预览、初始位姿和充电控制
 - 右侧地图画布
-  - 显示 `PCD`、2D 栅格、机器人位姿、任务点和导航状态
+  - `PCD`、2D 栅格、机器人位姿、任务点和导航状态
 
 ## 推荐演示顺序
 
@@ -75,111 +65,165 @@
 6. 修改点位参数，展示并不是固定点位，而是带导航语义的任务点
 7. 最后展示右上角导航状态栏、初始位姿、充电控制和建图控制
 
-## 关键目录
+---
 
-- `src/pages/Home.tsx`
-  - 主页面、控制逻辑和各功能卡片
-- `src/hooks/usePcdScene.ts`
-  - Three.js 场景、点云加载、任务点交互、机器人 marker、2D 栅格叠加
-- `src/hooks/useRobotPosePolling.ts`
-  - 机器人位姿轮询
-- `src/store/useViewerStore.ts`
-  - Viewer 全局状态
-- `src/types/navigation.ts`
-  - 任务点与导航参数定义
-- `api/m20RobotProtocol.ts`
-  - M20 TCP 与建图 UDP 协议封装
-- `vite.config.ts`
-  - 本地 API 中间件，包括机器人接口、地图资源和建图接口
+## 快速开始（Docker，推荐）
 
-## 默认资源
+部署端只需要 Docker，不需要 Node、npm。
 
-当前默认点云：
-
-- `/api/map/pcd/sample%3Aoutside_15cm_simpled.pcd`
-
-当前页面可切换资源：
-
-- `样例 · outside_15cm_simpled.pcd`
-- `样例 · rv_roof_human_unnoised.pcd`
-- `地图 · siteB-20260616-105415`
-
-当前 2D 栅格来源：
-
-- `../data/maps/siteB-20260616-105415/occ_grid.pgm`
-- `../data/maps/siteB-20260616-105415/occ_grid.yaml`
-
-说明：
-
-- 当前只有 `siteB-20260616-105415` 这套地图资源与内置 `occ_grid` 绑定
-- 若切换到其他 `PCD`，页面会提示栅格可能不对齐
-
-## 本地运行
+### 前置要求
 
 ```bash
-export PATH=/home/wzy/pcd_ws/.node/node-v24.11.0-linux-x64/bin:$PATH
-export HOME=/home/wzy/pcd_ws/.npm-home
-export NPM_CONFIG_CACHE=/home/wzy/pcd_ws/.npm-cache
+# Ubuntu/Debian
+sudo apt install -y docker.io docker-compose-v2
+```
 
-cd /home/wzy/pcd_ws/web-pcd-viewer
+### 启动
+
+```bash
+# 在仓库根目录
+cp .env.example .env   # 修改机器人地址
+./start-docker.sh
+```
+
+访问 [http://localhost:4174](http://localhost:4174)。
+
+### 停止
+
+```bash
+./stop-docker.sh
+```
+
+### 常用操作
+
+```bash
+./start-docker.sh          # 构建并启动
+./stop-docker.sh           # 停止
+docker compose logs -f     # 查看日志
+```
+
+### Docker 常见问题
+
+**Q: `docker compose` 命令不存在？**
+
+```bash
+sudo apt install -y docker-compose-v2
+```
+
+**Q: 拉取镜像失败 / `connection reset by peer`？**
+
+国内网络配置镜像加速，编辑 `/etc/docker/daemon.json`：
+
+```json
+{
+  "registry-mirrors": [
+    "https://docker.1ms.run",
+    "https://docker.xuanyuan.me"
+  ]
+}
+```
+
+然后 `sudo systemctl restart docker`。
+
+---
+
+## 本地开发运行
+
+需要改代码、调试时使用：
+
+```bash
+cd web-pcd-viewer
 npm install
 npm run dev -- --host 0.0.0.0 --port 4174
 ```
 
-访问：
+访问 [http://localhost:4174](http://localhost:4174)。
 
-- [http://localhost:4174](http://localhost:4174)
-
-## 常用命令
+常用开发命令：
 
 ```bash
-npm run check
-npm run lint
-npm run test
+npm run check    # TypeScript 类型检查
+npm run lint     # ESLint
+npm run test     # 单元测试
 ```
 
-## 开发说明
+---
 
-- 场景渲染和交互主要集中在 `src/hooks/usePcdScene.ts`
-- 左侧控制面板和业务流程主要集中在 `src/pages/Home.tsx`
-- 本地接口全部走 `vite.config.ts` 中间件，便于前端联调时直接转发真实协议
-- 当前项目是“前端 + 本地协议桥接”的实机联调结构，不依赖额外后端服务
+## 关键目录
+
+| 文件 | 说明 |
+|---|---|
+| `src/pages/Home.tsx` | 主页面、控制逻辑和各功能卡片 |
+| `src/hooks/usePcdScene.ts` | Three.js 场景、点云加载、任务点交互、机器人 marker、2D 栅格叠加 |
+| `src/hooks/useRobotPosePolling.ts` | 机器人位姿轮询 |
+| `src/store/useViewerStore.ts` | Viewer 全局状态 |
+| `src/types/navigation.ts` | 任务点与导航参数定义 |
+| `api/m20RobotProtocol.ts` | M20 TCP 与建图 UDP 协议封装 |
+| `vite.config.ts` | 本地 API 中间件，包括机器人接口、地图资源和建图接口 |
+
+---
+
+## 默认资源
+
+| 来源 | 文件 |
+|---|---|
+| 样例 | `data/pcd_samples/outside_15cm_simpled.pcd` |
+| 样例 | `data/pcd_samples/rv_roof_human_unnoised.pcd` |
+| 地图 | `data/maps/siteB-20260616-105415/full_cloud.pcd` |
+
+2D 栅格来源：`data/maps/siteB-20260616-105415/occ_grid.pgm` + `occ_grid.yaml`。
+
+> 当前只有 `siteB-20260616-105415` 这套地图资源与内置 `occ_grid` 绑定。
+
+---
 
 ## 协议接入
 
-### 机器人本体
+### 机器人本体（TCP，默认 `10.21.31.103:30001`）
 
-- `GET /api/robot/pose`
-- `GET /api/robots/poses`
-- `POST /api/robot/initial-pose`
-- `POST /api/robot/navigation-task`
-- `GET /api/robot/navigation-task-status`
-- `POST /api/robot/charge`
+| API | 协议 | 说明 |
+|---|---|---|
+| `GET /api/robots/poses` | `1007 / 2` | 多机器人位姿列表 |
+| `POST /api/robot/initial-pose` | `2101 / 1` | 发布初始位姿 |
+| `POST /api/robot/navigation-task` | `1003 / 1` | 下发单点导航任务 |
+| `GET /api/robot/navigation-task-status` | `1007 / 1` | 查询导航任务状态 |
+| `POST /api/robot/charge` | `2 / 24` | 充电控制 |
 
-默认连接：
+### 建图网关（UDP，默认 `10.21.33.106:30100`）
 
-- `10.21.31.103:30001`
-
-### 建图网关
-
-- `GET /api/mapping/status`
-- `POST /api/mapping/start`
-- `POST /api/mapping/stop`
-- `GET /api/mapping/maps`
-- `POST /api/mapping/apply`
-
-默认连接：
-
-- `10.21.33.106:30100`
+| API | 协议 | 说明 |
+|---|---|---|
+| `POST /api/mapping/start` | `2200 / 1` | 开始建图 |
+| `POST /api/mapping/stop` | `2200 / 2` | 停止建图并保存 |
+| `GET /api/mapping/status` | `2200 / 3` | 查询建图状态 |
+| `POST /api/mapping/apply` | `2200 / 4` | 切换导航地图 |
+| `GET /api/mapping/maps` | `2200 / 6` | 列出本地地图 |
 
 ### 地图资源
 
-- `GET /api/map/pcd-files`
-- `GET /api/map/pcd/:id`
-- `GET /api/map/occ-grid/meta`
-- `GET /api/map/occ-grid/image`
+| API | 说明 |
+|---|---|
+| `GET /api/map/pcd-files` | 列出可切换的 PCD 资源 |
+| `GET /api/map/pcd/:id` | 获取指定 PCD 文件 |
+| `GET /api/map/occ-grid/meta` | 获取栅格地图元数据 |
+| `GET /api/map/occ-grid/image` | 获取栅格地图图像 |
 
-## 环境变量
+---
+
+## 配置参数
+
+### Docker 部署（`.env` 文件）
+
+```bash
+M20_ROBOT_HOST=10.21.31.103
+M20_ROBOT_PORT=30001
+M20_MAPPING_HOST=10.21.33.106
+M20_MAPPING_PORT=30100
+M20_DEFAULT_MAP_ASSET_NAME=siteB-20260616-105415
+APP_PORT=4174
+```
+
+### 本地开发（shell 环境变量）
 
 ```bash
 export M20_ROBOT_HOST=10.21.31.103
@@ -188,7 +232,7 @@ export M20_MAPPING_HOST=10.21.33.106
 export M20_MAPPING_PORT=30100
 ```
 
-多机器人预留：
+### 多机器人预留
 
 ```bash
 export M20_MULTI_ROBOTS='[
@@ -196,6 +240,8 @@ export M20_MULTI_ROBOTS='[
   {"id":"robot-b","name":"Robot B","host":"10.21.31.104","port":30001,"color":"#38bdf8"}
 ]'
 ```
+
+---
 
 ## 适合继续扩展的方向
 

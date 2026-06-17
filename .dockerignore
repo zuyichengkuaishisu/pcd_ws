@@ -1,0 +1,9 @@
+.git
+.trae
+.node
+.npm-cache
+.npm-home
+pic
+web-pcd-viewer/node_modules
+web-pcd-viewer/dist
+**/*.log

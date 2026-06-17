@@ -1,5 +1,7 @@
 import { readdir, readFile } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
@@ -26,9 +28,15 @@ const ROBOT_HOST = process.env.M20_ROBOT_HOST ?? "10.21.31.103";
 const ROBOT_PORT = Number(process.env.M20_ROBOT_PORT ?? "30001");
 const MAPPING_HOST = process.env.M20_MAPPING_HOST ?? "10.21.33.106";
 const MAPPING_PORT = Number(process.env.M20_MAPPING_PORT ?? "30100");
-const MAP_ASSET_DIR = "/home/wzy/pcd_ws/data/maps/siteB-20260616-105415";
+const PROJECT_DIR = dirname(fileURLToPath(import.meta.url));
+const WORKSPACE_DIR = resolve(PROJECT_DIR, "..");
+const MAPS_DIR = process.env.M20_MAPS_DIR ? resolve(process.env.M20_MAPS_DIR) : resolve(WORKSPACE_DIR, "data/maps");
+const PCD_SAMPLE_DIR = process.env.M20_PCD_SAMPLE_DIR
+  ? resolve(process.env.M20_PCD_SAMPLE_DIR)
+  : resolve(WORKSPACE_DIR, "data/pcd_samples");
+const DEFAULT_MAP_ASSET_NAME = process.env.M20_DEFAULT_MAP_ASSET_NAME ?? "siteB-20260616-105415";
+const MAP_ASSET_DIR = resolve(MAPS_DIR, DEFAULT_MAP_ASSET_NAME);
 const DEFAULT_PCD_ID = "sample:outside_15cm_simpled.pcd";
-const PCD_SAMPLE_DIR = "/home/wzy/pcd_ws/data/pcd_samples";
 const OCC_GRID_PGM_PATH = `${MAP_ASSET_DIR}/occ_grid.pgm`;
 const OCC_GRID_YAML_PATH = `${MAP_ASSET_DIR}/occ_grid.yaml`;
 
@@ -77,14 +85,14 @@ async function listAvailablePcdAssets() {
     });
   }
 
-  const mapEntries = await readdir("/home/wzy/pcd_ws/data/maps", { withFileTypes: true });
+  const mapEntries = await readdir(MAPS_DIR, { withFileTypes: true });
   for (const entry of mapEntries) {
     if (!entry.isDirectory()) {
       continue;
     }
     const fileName = "full_cloud.pcd";
-    const path = `/home/wzy/pcd_ws/data/maps/${entry.name}/${fileName}`;
-    const hasLinkedOccGrid = entry.name === "siteB-20260616-105415";
+    const path = resolve(MAPS_DIR, entry.name, fileName);
+    const hasLinkedOccGrid = entry.name === DEFAULT_MAP_ASSET_NAME;
     try {
       await readFile(path);
       assets.push({
