@@ -22,6 +22,8 @@ describe("useViewerStore", () => {
       robotLocationState: null,
       robotErrorMessage: "",
       robotPoseTime: "",
+      robots: [],
+      primaryRobotId: "robot-1",
     });
   });
 
@@ -62,5 +64,37 @@ describe("useViewerStore", () => {
     expect(state.robotConnectionStatus).toBe("ready");
     expect(state.robotLocationState).toBe(0);
     expect(state.robotPoseTime).toBe("2026-06-16 16:34:23.334");
+  });
+
+  it("stores multi-robot states and switches primary robot", () => {
+    useViewerStore.getState().setRobotStates([
+      {
+        id: "robot-a",
+        name: "Robot A",
+        pose: { x: 1, y: 2, z: 0.1, yaw: 0.3 },
+        locationState: 0,
+        connectionStatus: "ready",
+        errorMessage: "",
+        poseTime: "2026-06-17 10:00:00",
+        color: "#22c55e",
+      },
+      {
+        id: "robot-b",
+        name: "Robot B",
+        pose: { x: 5, y: 6, z: 0.1, yaw: 0.8 },
+        locationState: 0,
+        connectionStatus: "ready",
+        errorMessage: "",
+        poseTime: "2026-06-17 10:00:01",
+        color: "#38bdf8",
+      },
+    ]);
+
+    expect(useViewerStore.getState().primaryRobotId).toBe("robot-a");
+    expect(useViewerStore.getState().robotPose?.x).toBe(1);
+
+    useViewerStore.getState().setPrimaryRobot("robot-b");
+    expect(useViewerStore.getState().primaryRobotId).toBe("robot-b");
+    expect(useViewerStore.getState().robotPose?.x).toBe(5);
   });
 });

@@ -4,20 +4,28 @@ import { useViewerStore } from "@/store/useViewerStore";
 
 type RobotPoseApiResponse = {
   ok: boolean;
-  location?: number;
-  pose?: {
-    x: number;
-    y: number;
-    z: number;
-    yaw: number;
-  };
-  timestamp?: string;
+  robots?: Array<{
+    id: string;
+    name: string;
+    color?: string;
+    connectionStatus: "idle" | "loading" | "ready" | "error";
+    location?: number;
+    pose?: {
+      x: number;
+      y: number;
+      z: number;
+      yaw: number;
+    };
+    timestamp?: string;
+    error?: string;
+  }>;
   error?: string;
 };
 
 export function useRobotPosePolling(intervalMs = 2000) {
-  const setRobotPose = useViewerStore((state) => state.setRobotPose);
   const setRobotConnectionState = useViewerStore((state) => state.setRobotConnectionState);
+  const setRobotStates = useViewerStore((state) => state.setRobotStates);
+  const setRobotPose = useViewerStore((state) => state.setRobotPose);
 
   useEffect(() => {
     let disposed = false;
@@ -27,7 +35,7 @@ export function useRobotPosePolling(intervalMs = 2000) {
       setRobotConnectionState("loading");
 
       try {
-        const response = await fetch("/api/robot/pose", {
+        const response = await fetch("/api/robots/poses", {
           method: "GET",
           headers: {
             Accept: "application/json",
@@ -35,7 +43,7 @@ export function useRobotPosePolling(intervalMs = 2000) {
         });
 
         const result = (await response.json()) as RobotPoseApiResponse;
-        if (!response.ok || !result.ok || !result.pose) {
+        if (!response.ok || !result.ok || !Array.isArray(result.robots)) {
           throw new Error(result.error || `机器人位姿请求失败: HTTP ${response.status}`);
         }
 
@@ -43,17 +51,30 @@ export function useRobotPosePolling(intervalMs = 2000) {
           return;
         }
 
-        setRobotPose({
-          x: result.pose.x,
-          y: result.pose.y,
-          z: result.pose.z,
-          yaw: result.pose.yaw,
-        });
-        setRobotConnectionState("ready", result.location ?? null, "", result.timestamp ?? "");
+        const robots = result.robots.map((robot) => ({
+          id: robot.id,
+          name: robot.name,
+          color: robot.color,
+          pose: robot.pose
+            ? {
+                x: robot.pose.x,
+                y: robot.pose.y,
+                z: robot.pose.z,
+                yaw: robot.pose.yaw,
+              }
+            : null,
+          locationState: robot.location ?? null,
+          connectionStatus: robot.connectionStatus,
+          errorMessage: robot.error ?? "",
+          poseTime: robot.timestamp ?? "",
+        }));
+
+        setRobotStates(robots);
       } catch (error) {
         if (disposed) {
           return;
         }
+        setRobotStates([]);
         setRobotPose(null);
         setRobotConnectionState("error", null, error instanceof Error ? error.message : "机器人位姿请求失败");
       } finally {

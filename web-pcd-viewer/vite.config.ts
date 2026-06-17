@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 import { defineConfig } from 'vite'
@@ -27,11 +27,28 @@ const ROBOT_PORT = Number(process.env.M20_ROBOT_PORT ?? "30001");
 const MAPPING_HOST = process.env.M20_MAPPING_HOST ?? "10.21.33.106";
 const MAPPING_PORT = Number(process.env.M20_MAPPING_PORT ?? "30100");
 const MAP_ASSET_DIR = "/home/wzy/pcd_ws/data/maps/siteB-20260616-105415";
-const PCD_PATH = "/home/wzy/pcd_ws/data/pcd_samples/outside_15cm_simpled.pcd";
+const DEFAULT_PCD_ID = "sample:outside_15cm_simpled.pcd";
+const PCD_SAMPLE_DIR = "/home/wzy/pcd_ws/data/pcd_samples";
 const OCC_GRID_PGM_PATH = `${MAP_ASSET_DIR}/occ_grid.pgm`;
 const OCC_GRID_YAML_PATH = `${MAP_ASSET_DIR}/occ_grid.yaml`;
 
 type ApiHandler = (req: IncomingMessage, res: ServerResponse<IncomingMessage>) => Promise<void>;
+type RobotEndpointConfig = {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+  color?: string;
+};
+type PcdAsset = {
+  id: string;
+  name: string;
+  label: string;
+  path: string;
+  source: "sample" | "map";
+  mapName?: string;
+  hasLinkedOccGrid: boolean;
+};
 
 async function readJsonBody(req: IncomingMessage) {
   const chunks: Buffer[] = [];
@@ -40,6 +57,160 @@ async function readJsonBody(req: IncomingMessage) {
   }
   const raw = Buffer.concat(chunks).toString("utf-8");
   return raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+}
+
+async function listAvailablePcdAssets() {
+  const assets: PcdAsset[] = [];
+
+  const sampleEntries = await readdir(PCD_SAMPLE_DIR, { withFileTypes: true });
+  for (const entry of sampleEntries) {
+    if (!entry.isFile() || !entry.name.endsWith(".pcd")) {
+      continue;
+    }
+    assets.push({
+      id: `sample:${entry.name}`,
+      name: entry.name,
+      label: `样例 · ${entry.name}`,
+      path: `${PCD_SAMPLE_DIR}/${entry.name}`,
+      source: "sample",
+      hasLinkedOccGrid: false,
+    });
+  }
+
+  const mapEntries = await readdir("/home/wzy/pcd_ws/data/maps", { withFileTypes: true });
+  for (const entry of mapEntries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    const fileName = "full_cloud.pcd";
+    const path = `/home/wzy/pcd_ws/data/maps/${entry.name}/${fileName}`;
+    const hasLinkedOccGrid = entry.name === "siteB-20260616-105415";
+    try {
+      await readFile(path);
+      assets.push({
+        id: `map:${entry.name}:${fileName}`,
+        name: fileName,
+        label: `地图 · ${entry.name}`,
+        path,
+        source: "map",
+        mapName: entry.name,
+        hasLinkedOccGrid,
+      });
+    } catch {
+      // Ignore directories without full_cloud.pcd
+    }
+  }
+
+  assets.sort((left, right) => {
+    if (left.id === DEFAULT_PCD_ID) {
+      return -1;
+    }
+    if (right.id === DEFAULT_PCD_ID) {
+      return 1;
+    }
+    return left.label.localeCompare(right.label, "zh-CN");
+  });
+  return assets;
+}
+
+async function findPcdAssetById(id: string) {
+  const assets = await listAvailablePcdAssets();
+  return assets.find((asset) => asset.id === id) ?? null;
+}
+
+function getRobotEndpointConfigs(): RobotEndpointConfig[] {
+  const fallback = [
+    {
+      id: "robot-1",
+      name: "Robot 1",
+      host: ROBOT_HOST,
+      port: ROBOT_PORT,
+      color: "#22c55e",
+    },
+  ] satisfies RobotEndpointConfig[];
+
+  const raw = process.env.M20_MULTI_ROBOTS?.trim();
+  if (!raw) {
+    return fallback;
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+      return fallback;
+    }
+
+    const configs = parsed
+      .map((item, index) => {
+        const record = typeof item === "object" && item !== null ? (item as Record<string, unknown>) : null;
+        if (!record) {
+          return null;
+        }
+
+        const host = typeof record.host === "string" ? record.host.trim() : "";
+        const port = Number(record.port);
+        if (!host || Number.isNaN(port)) {
+          return null;
+        }
+
+        const config: RobotEndpointConfig = {
+          id: typeof record.id === "string" && record.id.trim() ? record.id.trim() : `robot-${index + 1}`,
+          name: typeof record.name === "string" && record.name.trim() ? record.name.trim() : `Robot ${index + 1}`,
+          host,
+          port,
+          color: typeof record.color === "string" && record.color.trim() ? record.color.trim() : undefined,
+        };
+        return config;
+      })
+      .filter((item): item is RobotEndpointConfig => item !== null);
+
+    return configs.length > 0 ? configs : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+async function requestRobotPoses(configs: RobotEndpointConfig[]) {
+  const results = await Promise.allSettled(
+    configs.map(async (config) => {
+      const response = await requestRobotPose(config.host, config.port);
+      return {
+        id: config.id,
+        name: config.name,
+        host: config.host,
+        port: config.port,
+        color: config.color,
+        connectionStatus: "ready" as const,
+        location: response.location,
+        pose: response.pose,
+        timestamp: response.timestamp,
+      };
+    }),
+  );
+
+  const robots = results.map((result, index) => {
+    const config = configs[index];
+    if (result.status === "fulfilled") {
+      return result.value;
+    }
+
+    return {
+      id: config.id,
+      name: config.name,
+      host: config.host,
+      port: config.port,
+      color: config.color,
+      connectionStatus: "error" as const,
+      error: result.reason instanceof Error ? result.reason.message : "机器人位姿请求失败",
+    };
+  });
+
+  const hasReadyRobot = robots.some((robot) => robot.connectionStatus === "ready");
+  return {
+    ok: hasReadyRobot,
+    robots,
+    error: hasReadyRobot ? undefined : "所有机器人位姿请求均失败",
+  };
 }
 
 async function readOccGridMeta() {
@@ -121,7 +292,9 @@ function createRobotPoseHandler(): ApiHandler {
     }
 
     try {
-      const response = await requestRobotPose(ROBOT_HOST, ROBOT_PORT);
+      const configs = getRobotEndpointConfigs();
+      const primary = configs[0];
+      const response = await requestRobotPose(primary.host, primary.port);
       res.statusCode = 200;
       res.end(JSON.stringify({ ok: true, ...response }));
     } catch (error) {
@@ -132,6 +305,33 @@ function createRobotPoseHandler(): ApiHandler {
           error: error instanceof Error ? error.message : "机器人位姿请求失败",
           host: ROBOT_HOST,
           port: ROBOT_PORT,
+        }),
+      );
+    }
+  };
+}
+
+function createRobotPosesHandler(): ApiHandler {
+  return async (req, res) => {
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+
+    if (req.method !== "GET") {
+      res.statusCode = 405;
+      res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
+      return;
+    }
+
+    try {
+      const result = await requestRobotPoses(getRobotEndpointConfigs());
+      res.statusCode = result.ok ? 200 : 502;
+      res.end(JSON.stringify(result));
+    } catch (error) {
+      res.statusCode = 502;
+      res.end(
+        JSON.stringify({
+          ok: false,
+          error: error instanceof Error ? error.message : "多机器人位姿请求失败",
         }),
       );
     }
@@ -356,7 +556,18 @@ function createPcdHandler(): ApiHandler {
     }
 
     try {
-      const content = await readFile(PCD_PATH);
+      const url = new URL(req.url ?? "", "http://localhost");
+      const rawPath = url.pathname.replace(/^\/api\/map\/pcd\//, "").replace(/^\/+/, "");
+      const pcdId = decodeURIComponent(rawPath);
+      const asset = await findPcdAssetById(pcdId);
+      if (!asset) {
+        res.statusCode = 404;
+        res.setHeader("Content-Type", "application/json; charset=utf-8");
+        res.end(JSON.stringify({ ok: false, error: "PCD 资源不存在" }));
+        return;
+      }
+
+      const content = await readFile(asset.path);
       res.statusCode = 200;
       res.setHeader("Content-Type", "application/octet-stream");
       res.end(content);
@@ -364,6 +575,42 @@ function createPcdHandler(): ApiHandler {
       res.statusCode = 500;
       res.setHeader("Content-Type", "application/json; charset=utf-8");
       res.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : "读取 PCD 文件失败" }));
+    }
+  };
+}
+
+function createPcdListHandler(): ApiHandler {
+  return async (req, res) => {
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+
+    if (req.method !== "GET") {
+      res.statusCode = 405;
+      res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
+      return;
+    }
+
+    try {
+      const assets = await listAvailablePcdAssets();
+      res.statusCode = 200;
+      res.end(
+        JSON.stringify({
+          ok: true,
+          defaultPcdId: DEFAULT_PCD_ID,
+          items: assets.map((asset) => ({
+            id: asset.id,
+            name: asset.name,
+            label: asset.label,
+            source: asset.source,
+            mapName: asset.mapName ?? "",
+            hasLinkedOccGrid: asset.hasLinkedOccGrid,
+            url: `/api/map/pcd/${encodeURIComponent(asset.id)}`,
+          })),
+        }),
+      );
+    } catch (error) {
+      res.statusCode = 500;
+      res.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : "读取 PCD 列表失败" }));
     }
   };
 }
@@ -544,6 +791,7 @@ function createMappingApplyHandler(): ApiHandler {
 
 function robotPoseApiPlugin() {
   const poseHandler = createRobotPoseHandler();
+  const posesHandler = createRobotPosesHandler();
   const initialPoseHandler = createInitialPoseHandler();
   const navigationTaskHandler = createNavigationTaskHandler();
   const navigationTaskStatusHandler = createNavigationTaskStatusHandler();
@@ -551,6 +799,7 @@ function robotPoseApiPlugin() {
   const occGridMetaHandler = createOccGridMetaHandler();
   const occGridImageHandler = createOccGridImageHandler();
   const pcdHandler = createPcdHandler();
+  const pcdListHandler = createPcdListHandler();
   const mappingStatusHandler = createMappingStatusHandler();
   const mappingStartHandler = createMappingStartHandler();
   const mappingStopHandler = createMappingStopHandler();
@@ -561,6 +810,7 @@ function robotPoseApiPlugin() {
     name: "robot-pose-api",
     configureServer(server: { middlewares: { use: (path: string, fn: ApiHandler) => void } }) {
       server.middlewares.use("/api/robot/pose", poseHandler);
+      server.middlewares.use("/api/robots/poses", posesHandler);
       server.middlewares.use("/api/robot/initial-pose", initialPoseHandler);
       server.middlewares.use("/api/robot/navigation-task", navigationTaskHandler);
       server.middlewares.use("/api/robot/navigation-task-status", navigationTaskStatusHandler);
@@ -570,12 +820,14 @@ function robotPoseApiPlugin() {
       server.middlewares.use("/api/mapping/stop", mappingStopHandler);
       server.middlewares.use("/api/mapping/maps", mappingListHandler);
       server.middlewares.use("/api/mapping/apply", mappingApplyHandler);
-      server.middlewares.use("/api/map/pcd/outside_15cm_simpled.pcd", pcdHandler);
+      server.middlewares.use("/api/map/pcd-files", pcdListHandler);
+      server.middlewares.use("/api/map/pcd/", pcdHandler);
       server.middlewares.use("/api/map/occ-grid/meta", occGridMetaHandler);
       server.middlewares.use("/api/map/occ-grid/image", occGridImageHandler);
     },
     configurePreviewServer(server: { middlewares: { use: (path: string, fn: ApiHandler) => void } }) {
       server.middlewares.use("/api/robot/pose", poseHandler);
+      server.middlewares.use("/api/robots/poses", posesHandler);
       server.middlewares.use("/api/robot/initial-pose", initialPoseHandler);
       server.middlewares.use("/api/robot/navigation-task", navigationTaskHandler);
       server.middlewares.use("/api/robot/navigation-task-status", navigationTaskStatusHandler);
@@ -585,7 +837,8 @@ function robotPoseApiPlugin() {
       server.middlewares.use("/api/mapping/stop", mappingStopHandler);
       server.middlewares.use("/api/mapping/maps", mappingListHandler);
       server.middlewares.use("/api/mapping/apply", mappingApplyHandler);
-      server.middlewares.use("/api/map/pcd/outside_15cm_simpled.pcd", pcdHandler);
+      server.middlewares.use("/api/map/pcd-files", pcdListHandler);
+      server.middlewares.use("/api/map/pcd/", pcdHandler);
       server.middlewares.use("/api/map/occ-grid/meta", occGridMetaHandler);
       server.middlewares.use("/api/map/occ-grid/image", occGridImageHandler);
     },

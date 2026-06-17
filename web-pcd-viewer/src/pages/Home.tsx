@@ -33,7 +33,6 @@ import {
 } from "@/types/navigation";
 import { formatMeters, formatPointCount, formatVector3, formatYawRadians } from "@/utils/viewerFormat";
 
-const FILE_URL = "/api/map/pcd/outside_15cm_simpled.pcd";
 const TASK_POINT_TYPE_ORDER: TaskPointType[] = [0, 1, 3];
 const NAVIGATION_SUCCESS_ERROR_CODES = new Set([0, 0x2300]);
 const DEFAULT_NAVIGATION_TASK = {
@@ -77,6 +76,25 @@ type MappingRuntimeState = {
   timestamp: string;
 };
 
+type SavedFloorSegment = {
+  id: string;
+  name: string;
+  minZ: number;
+  maxZ: number;
+};
+
+type PcdMapItem = {
+  id: string;
+  name: string;
+  label: string;
+  source: "sample" | "map";
+  mapName: string;
+  hasLinkedOccGrid: boolean;
+  url: string;
+};
+
+const DEFAULT_PCD_URL = `/api/map/pcd/${encodeURIComponent("sample:outside_15cm_simpled.pcd")}`;
+
 export default function Home() {
   const {
     pointSize,
@@ -96,18 +114,32 @@ export default function Home() {
     robotLocationState,
     robotErrorMessage,
     robotPoseTime,
+    robots,
+    primaryRobotId,
     setPointSize,
     toggleGrid,
     toggleAxes,
     toggleBackground,
     setStatus,
     setSceneInfo,
+    setPrimaryRobot,
   } = useViewerStore();
   const [taskEditorEnabled, setTaskEditorEnabled] = useState(false);
   const [pendingTaskPointType, setPendingTaskPointType] = useState<TaskPointType>(1);
   const [taskPoints, setTaskPoints] = useState<TaskPoint[]>([]);
   const [taskDispatchStatus, setTaskDispatchStatus] = useState<"idle" | "prepared" | "dispatching" | "error">("idle");
   const [taskDispatchMessage, setTaskDispatchMessage] = useState("点击“编辑任务点”后，长按并拖动鼠标即可添加点位并标定方向。");
+  const [floorSegmentationEnabled, setFloorSegmentationEnabled] = useState(false);
+  const [floorSegmentationDraftRange, setFloorSegmentationDraftRange] = useState<{ minZ: number; maxZ: number } | null>(null);
+  const [floorSegmentationAppliedRange, setFloorSegmentationAppliedRange] = useState<{ minZ: number; maxZ: number } | null>(null);
+  const [floorSegmentationMessage, setFloorSegmentationMessage] = useState("切到前视图后，手动调整上下两条 Z 高度分割线，确认只显示目标楼层。");
+  const [floorSegmentationCurrentPointCount, setFloorSegmentationCurrentPointCount] = useState(0);
+  const [floorPresetName, setFloorPresetName] = useState("");
+  const [savedFloorSegments, setSavedFloorSegments] = useState<SavedFloorSegment[]>([]);
+  const [pcdItems, setPcdItems] = useState<PcdMapItem[]>([]);
+  const [selectedPcdId, setSelectedPcdId] = useState("sample:outside_15cm_simpled.pcd");
+  const [selectedPcdUrl, setSelectedPcdUrl] = useState(DEFAULT_PCD_URL);
+  const [pcdListMessage, setPcdListMessage] = useState("正在读取可切换的 PCD 地图列表。");
   const [pointShape, setPointShape] = useState<"round" | "square">("round");
   const [initialPose, setInitialPose] = useState({
     x: "0.000",
@@ -153,8 +185,8 @@ export default function Home() {
     message: "等待查询导航状态",
   });
 
-  const { containerRef, resetView, setTopView } = usePcdScene({
-    fileUrl: FILE_URL,
+  const { containerRef, resetView, setTopView, setFrontView } = usePcdScene({
+    fileUrl: selectedPcdUrl,
     pointSize,
     pointShape,
     showGrid,
@@ -162,6 +194,9 @@ export default function Home() {
     darkBackground,
     showOccGrid,
     robotPose,
+    floorSegmentationEnabled,
+    floorSegmentationPreviewRange: floorSegmentationEnabled ? floorSegmentationDraftRange : null,
+    floorSegmentationAppliedRange,
     taskPoints,
     taskEditorEnabled,
     mapPlaneZ: mapOrigin.z,
@@ -194,11 +229,65 @@ export default function Home() {
       setTaskDispatchStatus("idle");
       setTaskDispatchMessage(`已添加${TASK_POINT_TYPE_META[pendingTaskPointType].label}，方向按拖动朝向写入。`);
     },
+    onFloorSegmentationPointCountChange: setFloorSegmentationCurrentPointCount,
     onStatus: setStatus,
     onSceneReady: setSceneInfo,
   });
 
   useRobotPosePolling();
+
+  useEffect(() => {
+    let disposed = false;
+
+    const loadPcdList = async () => {
+      try {
+        const response = await fetch("/api/map/pcd-files", {
+          method: "GET",
+          headers: {
+            Accept: "application/json",
+          },
+        });
+        const result = (await response.json()) as {
+          ok: boolean;
+          error?: string;
+          defaultPcdId?: string;
+          items?: PcdMapItem[];
+        };
+
+        if (!response.ok || !result.ok || !Array.isArray(result.items) || result.items.length === 0) {
+          throw new Error(result.error || `PCD 地图列表读取失败: HTTP ${response.status}`);
+        }
+
+        if (disposed) {
+          return;
+        }
+
+        const defaultItem =
+          result.items.find((item) => item.id === result.defaultPcdId) ??
+          result.items[0];
+
+        setPcdItems(result.items);
+        setSelectedPcdId(defaultItem.id);
+        setSelectedPcdUrl(defaultItem.url);
+        setPcdListMessage(
+          defaultItem.hasLinkedOccGrid
+            ? `当前选择 ${defaultItem.label}，可与当前 occ_grid 一起联看。`
+            : `当前选择 ${defaultItem.label}，该点云未绑定当前 occ_grid。`,
+        );
+      } catch (error) {
+        if (disposed) {
+          return;
+        }
+        setPcdListMessage(error instanceof Error ? error.message : "PCD 地图列表读取失败");
+      }
+    };
+
+    loadPcdList();
+
+    return () => {
+      disposed = true;
+    };
+  }, []);
 
   const statusTone =
     status === "error"
@@ -261,6 +350,29 @@ export default function Home() {
     }
     return "border-amber-300/40 bg-amber-300/10 text-amber-100";
   }, [chargeActionStatus]);
+
+  const floorSegmentationRange = useMemo(() => {
+    if (floorSegmentationDraftRange) {
+      return {
+        minZ: Math.min(floorSegmentationDraftRange.minZ, floorSegmentationDraftRange.maxZ),
+        maxZ: Math.max(floorSegmentationDraftRange.minZ, floorSegmentationDraftRange.maxZ),
+      };
+    }
+    return {
+      minZ: mapMin.z,
+      maxZ: mapMax.z,
+    };
+  }, [floorSegmentationDraftRange, mapMax.z, mapMin.z]);
+
+  const floorSegmentationStep = useMemo(
+    () => Math.max(Number((Math.max(bounds.height, 1) / 240).toFixed(3)), 0.01),
+    [bounds.height],
+  );
+
+  const selectedPcdItem = useMemo(
+    () => pcdItems.find((item) => item.id === selectedPcdId) ?? null,
+    [pcdItems, selectedPcdId],
+  );
 
   const mappingActionTone = useMemo(() => {
     if (mappingActionStatus === "error") {
@@ -537,6 +649,118 @@ export default function Home() {
       ...current,
       [field]: value,
     }));
+  };
+
+  const startFloorSegmentation = () => {
+    const initialRange = floorSegmentationAppliedRange ?? {
+      minZ: mapMin.z,
+      maxZ: mapMax.z,
+    };
+    setFloorSegmentationDraftRange(initialRange);
+    setFloorSegmentationEnabled(true);
+    setFloorSegmentationMessage("已切到前视图，请调整上下两条分割线高度。");
+    setFrontView();
+  };
+
+  const updateFloorSegmentationDraft = (field: "minZ" | "maxZ", value: number) => {
+    const clamped = Math.min(Math.max(value, mapMin.z), mapMax.z);
+    setFloorSegmentationDraftRange((current) => ({
+      minZ: current?.minZ ?? mapMin.z,
+      maxZ: current?.maxZ ?? mapMax.z,
+      [field]: clamped,
+    }));
+  };
+
+  const applyFloorSegmentation = () => {
+    const nextRange = {
+      minZ: Math.min(floorSegmentationRange.minZ, floorSegmentationRange.maxZ),
+      maxZ: Math.max(floorSegmentationRange.minZ, floorSegmentationRange.maxZ),
+    };
+    setFloorSegmentationAppliedRange(nextRange);
+    setFloorSegmentationEnabled(false);
+    setFloorSegmentationMessage(
+      `已确认楼层范围 Z=${nextRange.minZ.toFixed(2)} ~ ${nextRange.maxZ.toFixed(2)}，当前仅显示选中楼层点云。`,
+    );
+  };
+
+  const clearFloorSegmentation = () => {
+    setFloorSegmentationAppliedRange(null);
+    setFloorSegmentationEnabled(false);
+    setFloorSegmentationDraftRange(null);
+    setFloorSegmentationMessage("已恢复显示全部点云。");
+  };
+
+  const saveCurrentFloorSegment = () => {
+    const nextRange = {
+      minZ: Math.min(floorSegmentationRange.minZ, floorSegmentationRange.maxZ),
+      maxZ: Math.max(floorSegmentationRange.minZ, floorSegmentationRange.maxZ),
+    };
+    const name = floorPresetName.trim() || `楼层 ${savedFloorSegments.length + 1}`;
+    setSavedFloorSegments((current) => [
+      ...current,
+      {
+        id: crypto.randomUUID(),
+        name,
+        minZ: nextRange.minZ,
+        maxZ: nextRange.maxZ,
+      },
+    ]);
+    setFloorPresetName("");
+    setFloorSegmentationMessage(`已保存楼层预设“${name}”，可在下方预设列表快速切换。`);
+  };
+
+  const applySavedFloorSegment = (segment: SavedFloorSegment) => {
+    setFloorSegmentationDraftRange({
+      minZ: segment.minZ,
+      maxZ: segment.maxZ,
+    });
+    setFloorSegmentationAppliedRange({
+      minZ: segment.minZ,
+      maxZ: segment.maxZ,
+    });
+    setFloorSegmentationEnabled(false);
+    setFloorSegmentationMessage(
+      `已切换到楼层预设“${segment.name}”，当前显示 Z=${segment.minZ.toFixed(2)} ~ ${segment.maxZ.toFixed(2)} 的点云。`,
+    );
+  };
+
+  const loadSavedFloorSegmentForEditing = (segment: SavedFloorSegment) => {
+    setFloorSegmentationDraftRange({
+      minZ: segment.minZ,
+      maxZ: segment.maxZ,
+    });
+    setFloorSegmentationEnabled(true);
+    setFloorPresetName(segment.name);
+    setFloorSegmentationMessage(`已载入楼层预设“${segment.name}”，请继续调整分割线后确认。`);
+    setFrontView();
+  };
+
+  const removeSavedFloorSegment = (segmentId: string) => {
+    setSavedFloorSegments((current) => current.filter((segment) => segment.id !== segmentId));
+    setFloorSegmentationMessage("已删除对应楼层预设。");
+  };
+
+  const switchPcdMap = (nextItem: PcdMapItem) => {
+    setSelectedPcdId(nextItem.id);
+    setSelectedPcdUrl(nextItem.url);
+    setTaskEditorEnabled(false);
+    setTaskPoints([]);
+    setTaskDispatchStatus("idle");
+    setTaskDispatchMessage("地图已切换。点击“编辑任务点”后，长按并拖动鼠标即可添加点位并标定方向。");
+    setFloorSegmentationEnabled(false);
+    setFloorSegmentationDraftRange(null);
+    setFloorSegmentationAppliedRange(null);
+    setSavedFloorSegments([]);
+    setFloorPresetName("");
+    setFloorSegmentationMessage("地图已切换。若要按楼层分割，请重新选择当前 PCD 的 Z 轴范围。");
+    if (!nextItem.hasLinkedOccGrid) {
+      setShowOccGrid(false);
+    }
+    setPcdListMessage(
+      nextItem.hasLinkedOccGrid
+        ? `已切换到 ${nextItem.label}，可与当前 occ_grid 联看。`
+        : `已切换到 ${nextItem.label}，该点云未绑定当前 occ_grid，已自动关闭 2D 栅格。`,
+    );
   };
 
   const handleStartMapping = async () => {
@@ -849,6 +1073,48 @@ export default function Home() {
 
             <div className="rounded-[24px] border border-white/10 bg-slate-950/60 p-4">
               <div className="flex items-center gap-2 text-sm font-medium text-white">
+                <ScanSearch className="h-4 w-4 text-cyan-200" />
+                PCD 地图切换
+              </div>
+              <div className="mt-2 text-sm text-slate-400">
+                从样例点云或地图目录里的 `PCD` 中切换当前显示资源。
+              </div>
+              <div className="mt-4">
+                <select
+                  className="w-full rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
+                  value={selectedPcdId}
+                  onChange={(event) => {
+                    const nextId = event.target.value;
+                    const nextItem = pcdItems.find((item) => item.id === nextId);
+                    if (nextItem) {
+                      switchPcdMap(nextItem);
+                    }
+                  }}
+                >
+                  {pcdItems.length === 0 ? (
+                    <option value={selectedPcdId}>读取中...</option>
+                  ) : (
+                    pcdItems.map((item) => (
+                      <option key={item.id} value={item.id}>
+                        {item.label}
+                      </option>
+                    ))
+                  )}
+                </select>
+              </div>
+              <div className="mt-3 rounded-2xl border border-white/10 bg-white/[0.03] p-3 text-sm text-slate-300">
+                {pcdListMessage}
+              </div>
+              {selectedPcdItem ? (
+                <div className="mt-3 space-y-1 text-xs text-slate-400">
+                  <div>来源：{selectedPcdItem.source === "map" ? `地图目录 ${selectedPcdItem.mapName || "-"}` : "样例点云"}</div>
+                  <div>occ_grid：{selectedPcdItem.hasLinkedOccGrid ? "已绑定当前栅格" : "未绑定当前栅格"}</div>
+                </div>
+              ) : null}
+            </div>
+
+            <div className="rounded-[24px] border border-white/10 bg-slate-950/60 p-4">
+              <div className="flex items-center gap-2 text-sm font-medium text-white">
                 <Crosshair className="h-4 w-4 text-cyan-200" />
                 地图坐标
               </div>
@@ -935,6 +1201,142 @@ export default function Home() {
 
             <div className="rounded-[24px] border border-white/10 bg-slate-950/60 p-4">
               <div className="flex items-center gap-2 text-sm font-medium text-white">
+                <Box className="h-4 w-4 text-cyan-200" />
+                楼层分割
+              </div>
+              <div className="mt-2 text-sm text-slate-400">
+                按 Z 轴高度选择上下分割线，确认后只显示目标楼层点云。开启时会自动切到前视图，便于观察高度。
+              </div>
+
+              <div className="mt-4 flex flex-wrap gap-3">
+                <ControlButton
+                  onClick={startFloorSegmentation}
+                  disabled={status !== "ready"}
+                  className="border-cyan-300/40 bg-cyan-400/10 text-cyan-100 hover:bg-cyan-400/20"
+                >
+                  {floorSegmentationEnabled ? "重新对齐前视图" : "开始楼层分割"}
+                </ControlButton>
+                <ControlButton onClick={applyFloorSegmentation} disabled={!floorSegmentationEnabled || status !== "ready"}>
+                  确认只显示该楼层
+                </ControlButton>
+                <ControlButton
+                  onClick={() => setFloorSegmentationEnabled(false)}
+                  disabled={!floorSegmentationEnabled}
+                >
+                  取消编辑
+                </ControlButton>
+                <ControlButton onClick={clearFloorSegmentation} disabled={!floorSegmentationAppliedRange && !floorSegmentationEnabled}>
+                  恢复全部点云
+                </ControlButton>
+              </div>
+
+              <div className="mt-4 rounded-2xl border border-white/10 bg-white/[0.03] p-3 text-sm text-slate-300">
+                {floorSegmentationMessage}
+              </div>
+
+              <div className="mt-3 rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-2 text-sm text-slate-300">
+                当前楼层点数：{formatPointCount(floorSegmentationCurrentPointCount)}
+              </div>
+
+              <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                <label className="block">
+                  <div className="text-xs uppercase tracking-[0.25em] text-slate-500">下分割线 Z</div>
+                  <input
+                    className="mt-2 h-2 w-full cursor-pointer appearance-none rounded-full bg-white/10 accent-amber-300"
+                    type="range"
+                    min={mapMin.z}
+                    max={mapMax.z}
+                    step={floorSegmentationStep}
+                    value={floorSegmentationRange.minZ}
+                    disabled={!floorSegmentationEnabled || status !== "ready"}
+                    onChange={(event) => updateFloorSegmentationDraft("minZ", Number(event.target.value))}
+                  />
+                  <div className="mt-2 font-mono text-sm text-amber-100">{floorSegmentationRange.minZ.toFixed(3)} m</div>
+                </label>
+                <label className="block">
+                  <div className="text-xs uppercase tracking-[0.25em] text-slate-500">上分割线 Z</div>
+                  <input
+                    className="mt-2 h-2 w-full cursor-pointer appearance-none rounded-full bg-white/10 accent-cyan-300"
+                    type="range"
+                    min={mapMin.z}
+                    max={mapMax.z}
+                    step={floorSegmentationStep}
+                    value={floorSegmentationRange.maxZ}
+                    disabled={!floorSegmentationEnabled || status !== "ready"}
+                    onChange={(event) => updateFloorSegmentationDraft("maxZ", Number(event.target.value))}
+                  />
+                  <div className="mt-2 font-mono text-sm text-cyan-100">{floorSegmentationRange.maxZ.toFixed(3)} m</div>
+                </label>
+              </div>
+
+              <div className="mt-3 rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-2 text-sm text-slate-300">
+                当前楼层厚度：{Math.max(floorSegmentationRange.maxZ - floorSegmentationRange.minZ, 0).toFixed(3)} m
+              </div>
+
+              <div className="mt-4 text-xs uppercase tracking-[0.25em] text-slate-500">保存为楼层预设</div>
+              <div className="mt-3 flex flex-wrap gap-3">
+                <input
+                  className="min-w-0 flex-1 rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
+                  value={floorPresetName}
+                  onChange={(event) => setFloorPresetName(event.target.value)}
+                  placeholder={`例如：${savedFloorSegments.length + 1}F / 夹层 / 设备层`}
+                />
+                <ControlButton onClick={saveCurrentFloorSegment} disabled={status !== "ready"}>
+                  保存当前楼层
+                </ControlButton>
+              </div>
+
+              {floorSegmentationAppliedRange ? (
+                <div className="mt-3 rounded-2xl border border-emerald-400/20 bg-emerald-400/10 px-3 py-2 text-sm text-emerald-100">
+                  已应用楼层过滤：Z={floorSegmentationAppliedRange.minZ.toFixed(3)} ~ {floorSegmentationAppliedRange.maxZ.toFixed(3)} m
+                </div>
+              ) : null}
+
+              <div className="mt-4 text-xs uppercase tracking-[0.25em] text-slate-500">预设楼层列表</div>
+              <div className="mt-3 space-y-3">
+                {savedFloorSegments.length === 0 ? (
+                  <div className="rounded-2xl border border-dashed border-white/10 bg-white/[0.03] px-3 py-3 text-sm text-slate-400">
+                    还没有保存的楼层。先调整分割线，再点“保存当前楼层”。
+                  </div>
+                ) : (
+                  savedFloorSegments.map((segment) => {
+                    const isApplied =
+                      !!floorSegmentationAppliedRange &&
+                      Math.abs(floorSegmentationAppliedRange.minZ - segment.minZ) < 0.0001 &&
+                      Math.abs(floorSegmentationAppliedRange.maxZ - segment.maxZ) < 0.0001;
+                    return (
+                      <div key={segment.id} className="rounded-2xl border border-white/10 bg-white/[0.03] p-3">
+                        <div className="flex items-center justify-between gap-3">
+                          <div>
+                            <div className="font-medium text-white">{segment.name}</div>
+                            <div className="mt-1 font-mono text-xs text-slate-400">
+                              Z={segment.minZ.toFixed(3)} ~ {segment.maxZ.toFixed(3)} m
+                            </div>
+                          </div>
+                          <div className="rounded-full border border-white/10 px-2 py-1 text-xs text-slate-300">
+                            {isApplied ? "当前楼层" : "预设"}
+                          </div>
+                        </div>
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          <ControlButton onClick={() => applySavedFloorSegment(segment)}>
+                            直接显示
+                          </ControlButton>
+                          <ControlButton onClick={() => loadSavedFloorSegmentForEditing(segment)}>
+                            载入编辑
+                          </ControlButton>
+                          <ControlButton onClick={() => removeSavedFloorSegment(segment.id)}>
+                            删除
+                          </ControlButton>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+
+            <div className="rounded-[24px] border border-white/10 bg-slate-950/60 p-4">
+              <div className="flex items-center gap-2 text-sm font-medium text-white">
                 <LocateFixed className="h-4 w-4 text-emerald-300" />
                 机器人定位
               </div>
@@ -944,6 +1346,56 @@ export default function Home() {
                 {robotConnectionStatus === "error" && "接口异常"}
                 {robotConnectionStatus === "idle" && "等待启动"}
               </div>
+              <div className="mt-3 text-xs uppercase tracking-[0.25em] text-slate-500">多机器人接口预留</div>
+              <div className="mt-2 rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-2 text-sm text-slate-300">
+                当前轮询 `/api/robots/poses`，场景默认显示主机器人，已为多机器人定位接口和主机器人切换预留。
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                {robots.length === 0 ? (
+                  <div className="rounded-full border border-white/10 px-3 py-1.5 text-xs text-slate-400">暂无机器人</div>
+                ) : (
+                  robots.map((robot) => (
+                    <button
+                      key={robot.id}
+                      type="button"
+                      className={`rounded-full border px-3 py-1.5 text-xs transition ${
+                        primaryRobotId === robot.id
+                          ? "border-cyan-300/40 bg-cyan-400/10 text-cyan-100"
+                          : "border-white/10 bg-white/[0.03] text-slate-300 hover:bg-white/[0.06]"
+                      }`}
+                      onClick={() => setPrimaryRobot(robot.id)}
+                    >
+                      <span className="inline-flex items-center gap-2">
+                        <span
+                          className="h-2.5 w-2.5 rounded-full"
+                          style={{ backgroundColor: robot.color || (primaryRobotId === robot.id ? "#22c55e" : "#64748b") }}
+                        />
+                        {robot.name}
+                      </span>
+                    </button>
+                  ))
+                )}
+              </div>
+              {robots.length > 0 ? (
+                <div className="mt-3 space-y-2 rounded-2xl border border-white/10 bg-white/[0.03] p-3 text-sm text-slate-300">
+                  {robots.map((robot) => (
+                    <div key={`${robot.id}-summary`} className="flex items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="truncate text-white">{robot.name}</div>
+                        <div className="truncate text-xs text-slate-500">{robot.id}</div>
+                      </div>
+                      <div className="text-right text-xs">
+                        <div className={robot.connectionStatus === "ready" ? "text-emerald-200" : "text-rose-200"}>
+                          {formatRobotConnectionStatus(robot.connectionStatus)}
+                        </div>
+                        <div className="text-slate-500">
+                          {robot.pose ? `${robot.pose.x.toFixed(2)}, ${robot.pose.y.toFixed(2)}` : "-"}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
               {robotPose ? (
                 <div className="mt-3 space-y-2 text-sm text-slate-300">
                   <div>
@@ -967,7 +1419,7 @@ export default function Home() {
                 </div>
               ) : (
                 <div className="mt-3 rounded-2xl border border-dashed border-white/10 bg-white/[0.03] px-3 py-3 text-sm text-slate-400">
-                  暂无机器人位姿输入。页面会轮询 `/api/robot/pose`，一旦拿到位姿就自动更新场景里的绿色 marker。
+                  暂无机器人位姿输入。页面会轮询 `/api/robots/poses`，当前默认显示主机器人位姿。
                 </div>
               )}
               {robotErrorMessage ? (
@@ -975,6 +1427,159 @@ export default function Home() {
                   {robotErrorMessage}
                 </div>
               ) : null}
+            </div>
+
+            <div className="rounded-[24px] border border-white/10 bg-slate-950/60 p-4">
+              <div className="flex items-center gap-2 text-sm font-medium text-white">
+                <ScanSearch className="h-4 w-4 text-fuchsia-300" />
+                建图与地图
+              </div>
+              <div className="mt-2 text-sm text-slate-400">
+                已接入 `2200` 建图 UDP 网关，支持开始建图、停止保存、状态轮询和切换导航地图。
+              </div>
+
+              <div className="mt-4 inline-flex rounded-full border px-3 py-1.5 text-sm">
+                {mappingRuntime.connection === "loading" && "建图状态查询中"}
+                {mappingRuntime.connection === "ready" && `当前状态：${formatMappingTaskState(mappingRuntime.taskState)}`}
+                {mappingRuntime.connection === "error" && "建图状态异常"}
+                {mappingRuntime.connection === "idle" && "等待查询建图状态"}
+              </div>
+
+              <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                <label className="block sm:col-span-2">
+                  <div className="text-xs uppercase tracking-[0.25em] text-slate-500">MapName</div>
+                  <input
+                    className="mt-2 w-full rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
+                    value={mappingForm.mapName}
+                    onChange={(event) => updateMappingFormField("mapName", event.target.value)}
+                    placeholder="可选，留空则由网关自动生成"
+                    disabled={mappingActionStatus === "submitting"}
+                  />
+                </label>
+              </div>
+
+              <div className="mt-4 flex flex-wrap gap-2">
+                <ToggleChip
+                  label="Headless"
+                  active={mappingForm.headless}
+                  onClick={() => updateMappingFormField("headless", !mappingForm.headless)}
+                />
+                <ToggleChip
+                  label="室外模式"
+                  active={mappingForm.outdoor}
+                  onClick={() => updateMappingFormField("outdoor", !mappingForm.outdoor)}
+                />
+                <ToggleChip
+                  label="建完生效"
+                  active={mappingForm.activateAfterStop}
+                  onClick={() => updateMappingFormField("activateAfterStop", !mappingForm.activateAfterStop)}
+                />
+              </div>
+
+              <div className="mt-4 flex flex-wrap gap-3">
+                <ControlButton
+                  onClick={handleStartMapping}
+                  disabled={mappingActionStatus === "submitting" || mappingRuntime.taskState === "running" || mappingRuntime.taskState === "saving"}
+                  className="border-cyan-300/40 bg-cyan-400/10 text-cyan-100 hover:bg-cyan-400/20"
+                >
+                  <Send className="h-4 w-4" />
+                  {mappingActionStatus === "submitting" ? "处理中" : "开始建图"}
+                </ControlButton>
+                <ControlButton
+                  onClick={handleStopMapping}
+                  disabled={mappingActionStatus === "submitting" || mappingRuntime.taskState !== "running"}
+                  className="border-amber-300/40 bg-amber-400/10 text-amber-100 hover:bg-amber-400/20"
+                >
+                  <Send className="h-4 w-4" />
+                  停止并保存
+                </ControlButton>
+              </div>
+
+              <div className={`mt-4 inline-flex rounded-full border px-3 py-1.5 text-sm ${mappingActionTone}`}>
+                {mappingActionStatus === "submitting" && "建图指令处理中"}
+                {mappingActionStatus === "success" && "建图指令成功"}
+                {mappingActionStatus === "error" && "建图指令异常"}
+                {mappingActionStatus === "idle" && "等待手动控制"}
+              </div>
+
+              <div className="mt-3 rounded-2xl border border-white/10 bg-white/[0.03] p-3 text-sm text-slate-300">
+                {mappingActionMessage}
+              </div>
+
+              <div className="mt-4 grid gap-2 text-sm text-slate-300">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-slate-500">任务状态</span>
+                  <span>{formatMappingTaskState(mappingRuntime.taskState)}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-slate-500">当前地图</span>
+                  <span className="truncate text-right">{mappingRuntime.activeMapName || "-"}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-slate-500">MappingService</span>
+                  <span>{mappingRuntime.mappingService || "-"}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-slate-500">Localization</span>
+                  <span>{mappingRuntime.localizationService || "-"}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-slate-500">Rsdriver</span>
+                  <span>{mappingRuntime.rsdriverService || "-"}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-slate-500">产物完整</span>
+                  <span>{mappingRuntime.artifactsOk ? "是" : "否"}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-slate-500">错误码</span>
+                  <span>{formatHexCode(mappingRuntime.errorCode)}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-slate-500">更新时间</span>
+                  <span>{mappingRuntime.timestamp || "-"}</span>
+                </div>
+              </div>
+
+              <div className="mt-4 text-xs uppercase tracking-[0.25em] text-slate-500">本地地图列表</div>
+              <div className="mt-3 max-h-72 space-y-3 overflow-auto pr-1">
+                {mappingRuntime.maps.length === 0 ? (
+                  <div className="rounded-2xl border border-dashed border-white/10 bg-white/[0.03] px-3 py-3 text-sm text-slate-400">
+                    暂无地图列表，等待网关返回。
+                  </div>
+                ) : (
+                  mappingRuntime.maps.map((item) => (
+                    <div key={item.path || item.name} className="rounded-2xl border border-white/10 bg-white/[0.03] p-3">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="truncate font-medium text-white">{item.name || "-"}</div>
+                          <div className="mt-1 break-all text-xs text-slate-500">{item.path || "-"}</div>
+                        </div>
+                        <div className="rounded-full border border-white/10 px-2 py-1 text-xs text-slate-300">
+                          {item.isActive ? "当前激活" : "待切换"}
+                        </div>
+                      </div>
+                      <div className="mt-2 flex items-center justify-between gap-3 text-xs text-slate-400">
+                        <span>产物：{item.artifactsOk ? "完整" : "不完整"}</span>
+                        <span>{item.mtime || "-"}</span>
+                      </div>
+                      <div className="mt-3">
+                        <ControlButton
+                          onClick={() => handleApplyMapping(item.name)}
+                          disabled={
+                            mappingActionStatus === "submitting" ||
+                            mappingRuntime.taskState === "running" ||
+                            mappingRuntime.taskState === "saving" ||
+                            item.isActive
+                          }
+                        >
+                          {mappingApplyingName === item.name ? "切换中" : item.isActive ? "当前地图" : "切换到该地图"}
+                        </ControlButton>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
             </div>
 
             <div className="rounded-[24px] border border-white/10 bg-slate-950/60 p-4">
@@ -1332,8 +1937,8 @@ export default function Home() {
             <div className="absolute left-4 top-4 rounded-2xl border border-white/10 bg-slate-950/75 px-4 py-3 text-sm text-slate-300 shadow-[0_12px_40px_rgba(0,0,0,0.3)] backdrop-blur">
               <div className="font-mono text-xs uppercase tracking-[0.35em] text-cyan-100">Active File</div>
               <div className="mt-2 text-base text-white">{fileName}</div>
-              <div className="mt-1 text-xs text-slate-400">{FILE_URL}</div>
-              <div className="mt-3 text-xs text-slate-400">红色点: 地图原点 | 绿色箭头: 机器人位姿</div>
+              <div className="mt-1 text-xs text-slate-400">{selectedPcdUrl}</div>
+              <div className="mt-3 text-xs text-slate-400">XYZ 坐标轴 | 绿色箭头: 机器人位姿</div>
               <div className="mt-1 text-xs text-slate-400">
                 黄: 过渡点 | 青: 任务点 | 紫: 充电点
               </div>
@@ -1467,4 +2072,40 @@ function formatNavigationRuntimeMessage(status: number | null, errorCode: number
     return `导航异常 ${formatNavigationErrorCode(errorCode)}`;
   }
   return formatNavigationStatusLabel(status);
+}
+
+function formatRobotConnectionStatus(status: "idle" | "loading" | "ready" | "error") {
+  if (status === "ready") {
+    return "在线";
+  }
+  if (status === "loading") {
+    return "请求中";
+  }
+  if (status === "error") {
+    return "异常";
+  }
+  return "待机";
+}
+
+function formatHexCode(value: number | null) {
+  if (value === null) {
+    return "-";
+  }
+  return `0x${value.toString(16).toUpperCase()}`;
+}
+
+function formatMappingTaskState(taskState: string) {
+  if (taskState === "idle") {
+    return "空闲";
+  }
+  if (taskState === "running") {
+    return "建图中";
+  }
+  if (taskState === "saving") {
+    return "保存中";
+  }
+  if (taskState === "failed") {
+    return "异常";
+  }
+  return taskState || "未知";
 }

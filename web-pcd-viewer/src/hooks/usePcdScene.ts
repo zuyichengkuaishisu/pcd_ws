@@ -17,10 +17,14 @@ type UsePcdSceneOptions = {
   darkBackground: boolean;
   showOccGrid: boolean;
   robotPose: RobotPose | null;
+  floorSegmentationEnabled: boolean;
+  floorSegmentationPreviewRange: { minZ: number; maxZ: number } | null;
+  floorSegmentationAppliedRange: { minZ: number; maxZ: number } | null;
   taskPoints: TaskPoint[];
   taskEditorEnabled: boolean;
   mapPlaneZ: number;
   onAddTaskPoint: (point: { x: number; y: number; z: number; yaw: number }) => void;
+  onFloorSegmentationPointCountChange?: (pointCount: number) => void;
   onStatus: (status: ViewerStatus, errorMessage?: string) => void;
   onSceneReady: (
     pointCount: number,
@@ -51,6 +55,7 @@ type UsePcdSceneResult = {
   containerRef: React.RefObject<HTMLDivElement>;
   resetView: () => void;
   setTopView: () => void;
+  setFrontView: () => void;
 };
 
 export function usePcdScene({
@@ -62,10 +67,14 @@ export function usePcdScene({
   darkBackground,
   showOccGrid,
   robotPose,
+  floorSegmentationEnabled,
+  floorSegmentationPreviewRange,
+  floorSegmentationAppliedRange,
   taskPoints,
   taskEditorEnabled,
   mapPlaneZ,
   onAddTaskPoint,
+  onFloorSegmentationPointCountChange,
   onStatus,
   onSceneReady,
 }: UsePcdSceneOptions): UsePcdSceneResult {
@@ -80,13 +89,20 @@ export function usePcdScene({
   const pointsRef = useRef<THREE.Points | null>(null);
   const occGridMeshRef = useRef<THREE.Mesh | null>(null);
   const robotMarkerRef = useRef<THREE.Group | null>(null);
+  const floorSegmentationGroupRef = useRef<THREE.Group | null>(null);
   const taskPointGroupRef = useRef<THREE.Group | null>(null);
   const taskLineRef = useRef<THREE.Line | null>(null);
   const draftTaskMarkerRef = useRef<THREE.Group | null>(null);
   const draftTaskLineRef = useRef<THREE.Line | null>(null);
   const defaultPoseRef = useRef<CameraPose | null>(null);
   const topPoseRef = useRef<CameraPose | null>(null);
+  const frontPoseRef = useRef<CameraPose | null>(null);
   const robotMarkerLiftRef = useRef(0.15);
+  const floorSegmentationBoundsRef = useRef<THREE.Box3 | null>(null);
+  const fullPointDataRef = useRef<{
+    position: Float32Array;
+    color: Float32Array | null;
+  } | null>(null);
   const pointSizeRef = useRef(pointSize);
   const pointShapeRef = useRef(pointShape);
   const showGridRef = useRef(showGrid);
@@ -95,6 +111,9 @@ export function usePcdScene({
   const darkBackgroundRef = useRef(darkBackground);
   const robotPoseRef = useRef(robotPose);
   const taskPointsRef = useRef(taskPoints);
+  const floorSegmentationEnabledRef = useRef(floorSegmentationEnabled);
+  const floorSegmentationPreviewRangeRef = useRef(floorSegmentationPreviewRange);
+  const floorSegmentationAppliedRangeRef = useRef(floorSegmentationAppliedRange);
   const taskEditorEnabledRef = useRef(taskEditorEnabled);
   const mapPlaneZRef = useRef(mapPlaneZ);
   const addTaskPointRef = useRef(onAddTaskPoint);
@@ -136,6 +155,18 @@ export function usePcdScene({
   }, [taskPoints]);
 
   useEffect(() => {
+    floorSegmentationEnabledRef.current = floorSegmentationEnabled;
+  }, [floorSegmentationEnabled]);
+
+  useEffect(() => {
+    floorSegmentationPreviewRangeRef.current = floorSegmentationPreviewRange;
+  }, [floorSegmentationPreviewRange]);
+
+  useEffect(() => {
+    floorSegmentationAppliedRangeRef.current = floorSegmentationAppliedRange;
+  }, [floorSegmentationAppliedRange]);
+
+  useEffect(() => {
     taskEditorEnabledRef.current = taskEditorEnabled;
   }, [taskEditorEnabled]);
 
@@ -164,6 +195,10 @@ export function usePcdScene({
 
   const setTopView = useCallback(() => {
     applyPose(topPoseRef.current);
+  }, [applyPose]);
+
+  const setFrontView = useCallback(() => {
+    applyPose(frontPoseRef.current);
   }, [applyPose]);
 
   useEffect(() => {
@@ -204,6 +239,30 @@ export function usePcdScene({
       material.needsUpdate = true;
     }
   }, [pointShape, pointSize]);
+
+  useEffect(() => {
+    updateFloorSegmentationPreview(
+      sceneRef.current,
+      floorSegmentationGroupRef.current,
+      floorSegmentationBoundsRef.current,
+      floorSegmentationEnabled,
+      floorSegmentationPreviewRange,
+      darkBackground,
+    );
+  }, [darkBackground, floorSegmentationEnabled, floorSegmentationPreviewRange]);
+
+  useEffect(() => {
+    applyFloorSegmentationRange(pointsRef.current, fullPointDataRef.current, floorSegmentationAppliedRange);
+  }, [floorSegmentationAppliedRange]);
+
+  useEffect(() => {
+    if (!onFloorSegmentationPointCountChange) {
+      return;
+    }
+
+    const effectiveRange = floorSegmentationEnabled ? floorSegmentationPreviewRange : floorSegmentationAppliedRange;
+    onFloorSegmentationPointCountChange(countPointsInRange(fullPointDataRef.current, effectiveRange));
+  }, [floorSegmentationAppliedRange, floorSegmentationEnabled, floorSegmentationPreviewRange, onFloorSegmentationPointCountChange]);
 
   useEffect(() => {
     if (gridRef.current) {
@@ -514,6 +573,7 @@ export function usePcdScene({
         applyPointShape(material, pointShapeRef.current);
 
         const position = points.geometry.getAttribute("position");
+        const color = points.geometry.getAttribute("color");
         points.geometry.computeBoundingBox();
         const box = points.geometry.boundingBox?.clone() ?? new THREE.Box3();
         const center = box.getCenter(new THREE.Vector3());
@@ -523,6 +583,18 @@ export function usePcdScene({
 
         pointsRef.current = points;
         scene.add(points);
+        floorSegmentationBoundsRef.current = box.clone();
+        fullPointDataRef.current = {
+          position: Float32Array.from(position.array as ArrayLike<number>),
+          color: color ? Float32Array.from(color.array as ArrayLike<number>) : null,
+        };
+        applyFloorSegmentationRange(points, fullPointDataRef.current, floorSegmentationAppliedRangeRef.current);
+        onFloorSegmentationPointCountChange?.(
+          countPointsInRange(
+            fullPointDataRef.current,
+            floorSegmentationEnabledRef.current ? floorSegmentationPreviewRangeRef.current : floorSegmentationAppliedRangeRef.current,
+          ),
+        );
 
         if (robotMarkerRef.current) {
           scene.remove(robotMarkerRef.current);
@@ -584,7 +656,26 @@ export function usePcdScene({
           target: center.clone(),
           up: new THREE.Vector3(0, 1, 0),
         };
+        frontPoseRef.current = {
+          position: new THREE.Vector3(center.x, center.y - radius * 1.35, center.z + size.z * 0.08),
+          target: center.clone(),
+          up: new THREE.Vector3(0, 0, 1),
+        };
         resetView();
+
+        if (floorSegmentationGroupRef.current) {
+          scene.remove(floorSegmentationGroupRef.current);
+        }
+        floorSegmentationGroupRef.current = new THREE.Group();
+        scene.add(floorSegmentationGroupRef.current);
+        updateFloorSegmentationPreview(
+          scene,
+          floorSegmentationGroupRef.current,
+          box,
+          floorSegmentationEnabledRef.current,
+          floorSegmentationPreviewRangeRef.current,
+          darkBackgroundRef.current,
+        );
 
         if (robotPoseRef.current) {
           robotMarker.position.set(
@@ -646,6 +737,8 @@ export function usePcdScene({
       if (frameRef.current !== null) {
         cancelAnimationFrame(frameRef.current);
       }
+      fullPointDataRef.current = null;
+      floorSegmentationBoundsRef.current = null;
       controls.dispose();
       renderer.dispose();
       scene.clear();
@@ -657,6 +750,7 @@ export function usePcdScene({
     containerRef,
     resetView,
     setTopView,
+    setFrontView,
   };
 }
 
@@ -766,6 +860,169 @@ function createTaskMarker(
 function setLinePositions(geometry: THREE.BufferGeometry, positions: number[]) {
   geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
   geometry.computeBoundingSphere();
+}
+
+function applyFloorSegmentationRange(
+  points: THREE.Points | null,
+  source: { position: Float32Array; color: Float32Array | null } | null,
+  range: { minZ: number; maxZ: number } | null,
+) {
+  if (!points || !source) {
+    return;
+  }
+
+  const geometry = points.geometry as THREE.BufferGeometry;
+  if (!range) {
+    geometry.setAttribute("position", new THREE.Float32BufferAttribute(source.position, 3));
+    if (source.color) {
+      geometry.setAttribute("color", new THREE.Float32BufferAttribute(source.color, 3));
+    }
+    geometry.computeBoundingBox();
+    geometry.computeBoundingSphere();
+    return;
+  }
+
+  const minZ = Math.min(range.minZ, range.maxZ);
+  const maxZ = Math.max(range.minZ, range.maxZ);
+  const nextPositions: number[] = [];
+  const nextColors: number[] = [];
+
+  for (let index = 0; index < source.position.length; index += 3) {
+    const z = source.position[index + 2];
+    if (z < minZ || z > maxZ) {
+      continue;
+    }
+
+    nextPositions.push(source.position[index], source.position[index + 1], z);
+    if (source.color) {
+      nextColors.push(source.color[index], source.color[index + 1], source.color[index + 2]);
+    }
+  }
+
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute(nextPositions, 3));
+  if (source.color) {
+    geometry.setAttribute("color", new THREE.Float32BufferAttribute(nextColors, 3));
+  }
+  geometry.computeBoundingBox();
+  geometry.computeBoundingSphere();
+}
+
+function countPointsInRange(
+  source: { position: Float32Array; color: Float32Array | null } | null,
+  range: { minZ: number; maxZ: number } | null,
+) {
+  if (!source) {
+    return 0;
+  }
+
+  if (!range) {
+    return source.position.length / 3;
+  }
+
+  const minZ = Math.min(range.minZ, range.maxZ);
+  const maxZ = Math.max(range.minZ, range.maxZ);
+  let count = 0;
+
+  for (let index = 2; index < source.position.length; index += 3) {
+    const z = source.position[index];
+    if (z >= minZ && z <= maxZ) {
+      count += 1;
+    }
+  }
+
+  return count;
+}
+
+function updateFloorSegmentationPreview(
+  scene: THREE.Scene | null,
+  group: THREE.Group | null,
+  bounds: THREE.Box3 | null,
+  enabled: boolean,
+  range: { minZ: number; maxZ: number } | null,
+  darkBackground: boolean,
+) {
+  if (!scene || !group || !bounds) {
+    return;
+  }
+
+  group.clear();
+  if (!enabled || !range) {
+    group.visible = false;
+    return;
+  }
+
+  const min = bounds.min;
+  const max = bounds.max;
+  const inset = Math.max(Math.max(max.x - min.x, max.y - min.y) * 0.01, 0.08);
+  const lowerZ = Math.min(range.minZ, range.maxZ);
+  const upperZ = Math.max(range.minZ, range.maxZ);
+
+  const lowerLoop = createFloorSegmentationLoop(min, max, inset, lowerZ, darkBackground ? 0xfbbf24 : 0xd97706);
+  const upperLoop = createFloorSegmentationLoop(min, max, inset, upperZ, darkBackground ? 0x22d3ee : 0x0369a1);
+  const fill = createFloorSegmentationFill(min, max, inset, lowerZ, upperZ, darkBackground);
+
+  group.add(lowerLoop);
+  group.add(upperLoop);
+  group.add(fill);
+  group.visible = true;
+}
+
+function createFloorSegmentationLoop(
+  min: THREE.Vector3,
+  max: THREE.Vector3,
+  inset: number,
+  z: number,
+  color: THREE.ColorRepresentation,
+) {
+  const positions = [
+    min.x + inset,
+    min.y + inset,
+    z,
+    max.x - inset,
+    min.y + inset,
+    z,
+    max.x - inset,
+    max.y - inset,
+    z,
+    min.x + inset,
+    max.y - inset,
+    z,
+    min.x + inset,
+    min.y + inset,
+    z,
+  ];
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  return new THREE.Line(
+    geometry,
+    new THREE.LineBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.95,
+    }),
+  );
+}
+
+function createFloorSegmentationFill(
+  min: THREE.Vector3,
+  max: THREE.Vector3,
+  inset: number,
+  lowerZ: number,
+  upperZ: number,
+  darkBackground: boolean,
+) {
+  const geometry = new THREE.PlaneGeometry(Math.max(max.x - min.x - inset * 2, 0.1), Math.max(upperZ - lowerZ, 0.02));
+  const material = new THREE.MeshBasicMaterial({
+    color: darkBackground ? 0x22d3ee : 0x0891b2,
+    transparent: true,
+    opacity: 0.12,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  });
+  const plane = new THREE.Mesh(geometry, material);
+  plane.position.set(min.x + inset, (min.y + max.y) / 2, (lowerZ + upperZ) / 2);
+  plane.rotation.y = Math.PI / 2;
+  return plane;
 }
 
 function applyPointShape(material: THREE.PointsMaterial, pointShape: "round" | "square") {
