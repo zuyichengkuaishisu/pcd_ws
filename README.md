@@ -76,6 +76,26 @@ cp .env.example .env
 
 浏览器打开 [http://localhost:4174](http://localhost:4174)。
 
+`./start-docker.sh` 会先执行一次 `docker compose down --remove-orphans`，再重新 `build + up`，适合直接覆盖当前部署版本。
+
+### 启动后验证
+
+如果你想确认容器和前端页面是否真的起来了，可以直接执行：
+
+```bash
+# 查看容器状态
+docker compose ps
+
+# 查看首页是否返回 200
+curl -I http://localhost:4174
+```
+
+正常情况下你会看到：
+
+- `open-inspection-platform` 容器状态为 `Up`
+- `http://localhost:4174` 返回 `HTTP/1.1 200 OK`
+- 页面标题为“开源机器人巡检平台”
+
 ### 一键停止
 
 ```bash
@@ -94,6 +114,14 @@ APP_PORT=4174                   # 对外访问端口
 ```
 
 改完执行 `./stop-docker.sh && ./start-docker.sh` 重新构建即可。
+
+### 代码更新后的重建说明
+
+当前 Docker 部署跑的是前端构建产物，不是热更新开发模式。因此：
+
+- 修改 `web-pcd-viewer/src`、`vite.config.ts`、`data/` 下的地图资源后，页面不会自动刷新到最新版本
+- 需要重新执行 `./start-docker.sh`，让镜像重新构建后再验证
+- 新增 `PCD`、地图目录或 `occ_grid` 资源时，也建议重建一次，确保容器内资源同步
 
 ### Docker 常见问题
 
@@ -119,6 +147,38 @@ sudo apt install -y docker-compose-v2
 ```
 
 然后 `sudo systemctl restart docker`，再重新 `./start-docker.sh`。
+
+**Q: 启动时看到 `buildx isn't installed`？**
+
+这是 Docker Compose 的构建提示，不影响当前项目用普通方式完成镜像构建；如果最终容器已经正常启动、`curl -I http://localhost:4174` 返回 `200`，就可以继续使用。
+
+---
+
+## RK3588 / 机载部署说明
+
+这个项目已经补了一版偏机载部署的前端优化，目标不是追求桌面端最高画质，而是优先保证在 `RK3588` 这类 ARM 平台上“能稳定跑、能顺畅操作”。
+
+当前前端会自动识别低算力设备，并自动启用以下策略：
+
+- 限制 `DPR`，避免高分屏把 WebGL 填充率拉满
+- 大点云按预算自动抽样，避免原始百万级点数直接压满 GPU 和主线程
+- 交互时限帧、静止时降频渲染，避免页面一直满速 `requestAnimationFrame`
+- 放慢机器人位姿、导航状态、建图状态轮询，减少和点云渲染抢主线程
+
+这意味着部署到 `RK3588` 时，不需要额外手动切电源模式或改前端参数，默认就会走更稳的自动策略。
+
+### 对 RK3588 的预期
+
+- 用来看地图、切图、观察定位/导航状态、做初始化定位和基础交互，这套前端是可以跑起来的
+- 如果原始 `PCD` 特别大，首次加载依然可能慢，瓶颈更多在点云解析和资源体积，而不是纯显示
+- 如果现场地图经常非常大，建议额外准备一份“部署版抽样点云”，体验会更稳
+
+### 更适合机载部署的使用建议
+
+- 页面尽量保持单标签运行，不要同时开多个 Three.js 点云页面
+- 地图资源优先使用抽样或裁剪后的 `PCD`
+- 现场以 `Docker` 方式部署，减少节点环境差异
+- 如果只是联调机器人链路，可优先选择样例或单层地图，降低首次加载压力
 
 ---
 
@@ -251,12 +311,18 @@ open-inspection-platform/
 | 来源 | 文件 |
 |---|---|
 | 样例 | `data/pcd_samples/outside_15cm_simpled.pcd` |
+| 样例 | `data/pcd_samples/floors.pcd` |
 | 样例 | `data/pcd_samples/rv_roof_human_unnoised.pcd` |
 | 地图 | `data/maps/siteB-20260616-105415/full_cloud.pcd` |
 
-2D 栅格叠加资源来自 `data/maps/siteB-20260616-105415/occ_grid.pgm` + `occ_grid.yaml`。
+页面会自动扫描：
 
-> 当前只有 `siteB-20260616-105415` 这套地图资产与内置 `occ_grid` 绑定。切换到其他 PCD 时栅格可能不对齐，这是正常现象。
+- `data/pcd_samples/*.pcd` 下的样例点云
+- `data/maps/<map-dir>/` 下的任意 `.pcd` 文件
+
+如果某个地图目录同时存在 `occ_grid.pgm + occ_grid.yaml`，页面切换到该地图时会自动联动对应的 `2D` 栅格；切换到 `samples` 点云时则不显示 `2D` 栅格。
+
+> 当前只有带完整 `occ_grid` 资产的地图目录才会自动显示并对齐 `2D` 栅格；样例点云不显示栅格，这是预期行为。
 
 ---
 

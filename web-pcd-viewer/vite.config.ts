@@ -34,11 +34,7 @@ const MAPS_DIR = process.env.M20_MAPS_DIR ? resolve(process.env.M20_MAPS_DIR) : 
 const PCD_SAMPLE_DIR = process.env.M20_PCD_SAMPLE_DIR
   ? resolve(process.env.M20_PCD_SAMPLE_DIR)
   : resolve(WORKSPACE_DIR, "data/pcd_samples");
-const DEFAULT_MAP_ASSET_NAME = process.env.M20_DEFAULT_MAP_ASSET_NAME ?? "siteB-20260616-105415";
-const MAP_ASSET_DIR = resolve(MAPS_DIR, DEFAULT_MAP_ASSET_NAME);
 const DEFAULT_PCD_ID = "sample:outside_15cm_simpled.pcd";
-const OCC_GRID_PGM_PATH = `${MAP_ASSET_DIR}/occ_grid.pgm`;
-const OCC_GRID_YAML_PATH = `${MAP_ASSET_DIR}/occ_grid.yaml`;
 
 type ApiHandler = (req: IncomingMessage, res: ServerResponse<IncomingMessage>) => Promise<void>;
 type RobotEndpointConfig = {
@@ -90,22 +86,36 @@ async function listAvailablePcdAssets() {
     if (!entry.isDirectory()) {
       continue;
     }
-    const fileName = "full_cloud.pcd";
-    const path = resolve(MAPS_DIR, entry.name, fileName);
-    const hasLinkedOccGrid = entry.name === DEFAULT_MAP_ASSET_NAME;
-    try {
-      await readFile(path);
+    const mapDir = resolve(MAPS_DIR, entry.name);
+    const mapFileEntries = await readdir(mapDir, { withFileTypes: true });
+    const hasLinkedOccGrid =
+      mapFileEntries.some((fileEntry) => fileEntry.isFile() && fileEntry.name === "occ_grid.pgm") &&
+      mapFileEntries.some((fileEntry) => fileEntry.isFile() && fileEntry.name === "occ_grid.yaml");
+    const pcdFiles = mapFileEntries
+      .filter((fileEntry) => fileEntry.isFile() && fileEntry.name.endsWith(".pcd"))
+      .map((fileEntry) => fileEntry.name)
+      .sort((left, right) => {
+        if (left === "full_cloud.pcd") {
+          return -1;
+        }
+        if (right === "full_cloud.pcd") {
+          return 1;
+        }
+        return left.localeCompare(right, "zh-CN");
+      });
+
+    for (const fileName of pcdFiles) {
+      const path = resolve(mapDir, fileName);
+      const label = pcdFiles.length === 1 ? `地图 · ${entry.name}` : `地图 · ${entry.name} / ${fileName}`;
       assets.push({
         id: `map:${entry.name}:${fileName}`,
         name: fileName,
-        label: `地图 · ${entry.name}`,
+        label,
         path,
         source: "map",
         mapName: entry.name,
         hasLinkedOccGrid,
       });
-    } catch {
-      // Ignore directories without full_cloud.pcd
     }
   }
 
@@ -119,6 +129,23 @@ async function listAvailablePcdAssets() {
     return left.label.localeCompare(right.label, "zh-CN");
   });
   return assets;
+}
+
+async function resolveOccGridPathsByPcdId(pcdId: string | null) {
+  if (!pcdId) {
+    return null;
+  }
+
+  const asset = await findPcdAssetById(pcdId);
+  if (!asset || asset.source !== "map" || !asset.mapName || !asset.hasLinkedOccGrid) {
+    return null;
+  }
+
+  const mapDir = resolve(MAPS_DIR, asset.mapName);
+  return {
+    pgmPath: resolve(mapDir, "occ_grid.pgm"),
+    yamlPath: resolve(mapDir, "occ_grid.yaml"),
+  };
 }
 
 async function findPcdAssetById(id: string) {
@@ -221,8 +248,8 @@ async function requestRobotPoses(configs: RobotEndpointConfig[]) {
   };
 }
 
-async function readOccGridMeta() {
-  const yaml = await readFile(OCC_GRID_YAML_PATH, "utf-8");
+async function readOccGridMeta(yamlPath: string, pgmPath: string) {
+  const yaml = await readFile(yamlPath, "utf-8");
   const resolutionMatch = yaml.match(/^resolution:\s*([+-]?\d+(?:\.\d+)?)$/m);
   const originMatch = yaml.match(/^origin:\s*\[([^\]]+)\]$/m);
   if (!resolutionMatch || !originMatch) {
@@ -234,7 +261,7 @@ async function readOccGridMeta() {
     throw new Error("occ_grid.yaml 的 origin 参数无效");
   }
 
-  const pgm = await readFile(OCC_GRID_PGM_PATH);
+  const pgm = await readFile(pgmPath);
   const { width, height } = parsePgmHeader(pgm);
 
   return {
@@ -362,7 +389,7 @@ function createInitialPoseHandler(): ApiHandler {
       const pose = {
         x: Number(body.x),
         y: Number(body.y),
-        z: Number(body.z),
+        z: Number(body.z ?? 0),
         yaw: Number(body.yaw),
       };
 
@@ -520,7 +547,15 @@ function createOccGridMetaHandler(): ApiHandler {
     }
 
     try {
-      const meta = await readOccGridMeta();
+      const url = new URL(req.url ?? "", "http://localhost");
+      const paths = await resolveOccGridPathsByPcdId(url.searchParams.get("pcdId"));
+      if (!paths) {
+        res.statusCode = 404;
+        res.end(JSON.stringify({ ok: false, error: "当前 PCD 未绑定 2D 栅格地图" }));
+        return;
+      }
+
+      const meta = await readOccGridMeta(paths.yamlPath, paths.pgmPath);
       res.statusCode = 200;
       res.end(JSON.stringify({ ok: true, ...meta }));
     } catch (error) {
@@ -541,7 +576,16 @@ function createOccGridImageHandler(): ApiHandler {
     }
 
     try {
-      const content = await readFile(OCC_GRID_PGM_PATH);
+      const url = new URL(req.url ?? "", "http://localhost");
+      const paths = await resolveOccGridPathsByPcdId(url.searchParams.get("pcdId"));
+      if (!paths) {
+        res.statusCode = 404;
+        res.setHeader("Content-Type", "application/json; charset=utf-8");
+        res.end(JSON.stringify({ ok: false, error: "当前 PCD 未绑定 2D 栅格地图" }));
+        return;
+      }
+
+      const content = await readFile(paths.pgmPath);
       res.statusCode = 200;
       res.setHeader("Content-Type", "image/x-portable-graymap");
       res.end(content);

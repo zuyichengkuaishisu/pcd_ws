@@ -5,11 +5,14 @@ import { PCDLoader } from "three/examples/jsm/loaders/PCDLoader.js";
 
 import type { RobotPose, SceneBounds, ViewerStatus } from "@/store/useViewerStore";
 import { TASK_POINT_TYPE_META, type TaskPoint } from "@/types/navigation";
+import { downsamplePointCloudData, type PerformanceProfile } from "@/utils/performance";
 
 const ROBOT_YAW_OFFSET = -Math.PI / 2;
 
 type UsePcdSceneOptions = {
   fileUrl: string;
+  occGridAssetId: string | null;
+  performanceProfile: PerformanceProfile;
   pointSize: number;
   pointShape: "round" | "square";
   showGrid: boolean;
@@ -22,8 +25,11 @@ type UsePcdSceneOptions = {
   floorSegmentationAppliedRange: { minZ: number; maxZ: number } | null;
   taskPoints: TaskPoint[];
   taskEditorEnabled: boolean;
+  initialPoseEditorEnabled: boolean;
+  initialPoseSelection: { x: number; y: number; yaw: number } | null;
   mapPlaneZ: number;
   onAddTaskPoint: (point: { x: number; y: number; z: number; yaw: number }) => void;
+  onSetInitialPose: (point: { x: number; y: number; yaw: number }) => void;
   onFloorSegmentationPointCountChange?: (pointCount: number) => void;
   onStatus: (status: ViewerStatus, errorMessage?: string) => void;
   onSceneReady: (
@@ -60,6 +66,8 @@ type UsePcdSceneResult = {
 
 export function usePcdScene({
   fileUrl,
+  occGridAssetId,
+  performanceProfile,
   pointSize,
   pointShape,
   showGrid,
@@ -72,8 +80,11 @@ export function usePcdScene({
   floorSegmentationAppliedRange,
   taskPoints,
   taskEditorEnabled,
+  initialPoseEditorEnabled,
+  initialPoseSelection,
   mapPlaneZ,
   onAddTaskPoint,
+  onSetInitialPose,
   onFloorSegmentationPointCountChange,
   onStatus,
   onSceneReady,
@@ -84,6 +95,7 @@ export function usePcdScene({
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
   const frameRef = useRef<number | null>(null);
+  const idleTimerRef = useRef<number | null>(null);
   const gridRef = useRef<THREE.GridHelper | null>(null);
   const axesRef = useRef<THREE.AxesHelper | null>(null);
   const pointsRef = useRef<THREE.Points | null>(null);
@@ -94,6 +106,7 @@ export function usePcdScene({
   const taskLineRef = useRef<THREE.Line | null>(null);
   const draftTaskMarkerRef = useRef<THREE.Group | null>(null);
   const draftTaskLineRef = useRef<THREE.Line | null>(null);
+  const initialPoseMarkerRef = useRef<THREE.Group | null>(null);
   const defaultPoseRef = useRef<CameraPose | null>(null);
   const topPoseRef = useRef<CameraPose | null>(null);
   const frontPoseRef = useRef<CameraPose | null>(null);
@@ -115,69 +128,101 @@ export function usePcdScene({
   const floorSegmentationPreviewRangeRef = useRef(floorSegmentationPreviewRange);
   const floorSegmentationAppliedRangeRef = useRef(floorSegmentationAppliedRange);
   const taskEditorEnabledRef = useRef(taskEditorEnabled);
+  const initialPoseEditorEnabledRef = useRef(initialPoseEditorEnabled);
   const mapPlaneZRef = useRef(mapPlaneZ);
   const addTaskPointRef = useRef(onAddTaskPoint);
+  const setInitialPoseRef = useRef(onSetInitialPose);
   const draftTaskStateRef = useRef<DraftTaskPointerState | null>(null);
   const keysPressedRef = useRef(new Set<string>());
+  const interactionUntilRef = useRef(0);
+  const renderRequestedRef = useRef(true);
+
+  const requestRender = useCallback((interactionMs = 800) => {
+    const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+    interactionUntilRef.current = Math.max(interactionUntilRef.current, now + interactionMs);
+    renderRequestedRef.current = true;
+  }, []);
 
   useEffect(() => {
     pointSizeRef.current = pointSize;
-  }, [pointSize]);
+    requestRender();
+  }, [pointSize, requestRender]);
 
   useEffect(() => {
     pointShapeRef.current = pointShape;
-  }, [pointShape]);
+    requestRender();
+  }, [pointShape, requestRender]);
 
   useEffect(() => {
     showGridRef.current = showGrid;
-  }, [showGrid]);
+    requestRender();
+  }, [showGrid, requestRender]);
 
   useEffect(() => {
     showAxesRef.current = showAxes;
-  }, [showAxes]);
+    requestRender();
+  }, [showAxes, requestRender]);
 
   useEffect(() => {
     showOccGridRef.current = showOccGrid;
     if (occGridMeshRef.current) {
       occGridMeshRef.current.visible = showOccGrid;
     }
-  }, [showOccGrid]);
+    requestRender();
+  }, [showOccGrid, requestRender]);
 
   useEffect(() => {
     darkBackgroundRef.current = darkBackground;
-  }, [darkBackground]);
+    requestRender();
+  }, [darkBackground, requestRender]);
 
   useEffect(() => {
     robotPoseRef.current = robotPose;
-  }, [robotPose]);
+    requestRender(1200);
+  }, [robotPose, requestRender]);
 
   useEffect(() => {
     taskPointsRef.current = taskPoints;
-  }, [taskPoints]);
+    requestRender(1200);
+  }, [taskPoints, requestRender]);
 
   useEffect(() => {
     floorSegmentationEnabledRef.current = floorSegmentationEnabled;
-  }, [floorSegmentationEnabled]);
+    requestRender();
+  }, [floorSegmentationEnabled, requestRender]);
 
   useEffect(() => {
     floorSegmentationPreviewRangeRef.current = floorSegmentationPreviewRange;
-  }, [floorSegmentationPreviewRange]);
+    requestRender();
+  }, [floorSegmentationPreviewRange, requestRender]);
 
   useEffect(() => {
     floorSegmentationAppliedRangeRef.current = floorSegmentationAppliedRange;
-  }, [floorSegmentationAppliedRange]);
+    requestRender();
+  }, [floorSegmentationAppliedRange, requestRender]);
 
   useEffect(() => {
     taskEditorEnabledRef.current = taskEditorEnabled;
-  }, [taskEditorEnabled]);
+    requestRender();
+  }, [taskEditorEnabled, requestRender]);
+
+  useEffect(() => {
+    initialPoseEditorEnabledRef.current = initialPoseEditorEnabled;
+    requestRender();
+  }, [initialPoseEditorEnabled, requestRender]);
 
   useEffect(() => {
     mapPlaneZRef.current = mapPlaneZ;
-  }, [mapPlaneZ]);
+    requestRender();
+  }, [mapPlaneZ, requestRender]);
 
   useEffect(() => {
     addTaskPointRef.current = onAddTaskPoint;
   }, [onAddTaskPoint]);
+
+  useEffect(() => {
+    setInitialPoseRef.current = onSetInitialPose;
+  }, [onSetInitialPose]);
 
   const applyPose = useCallback((pose: CameraPose | null) => {
     if (!pose || !cameraRef.current || !controlsRef.current) {
@@ -239,7 +284,8 @@ export function usePcdScene({
       applyPointShape(material, pointShapeRef.current);
       material.needsUpdate = true;
     }
-  }, [pointShape, pointSize]);
+    requestRender();
+  }, [pointShape, pointSize, requestRender]);
 
   useEffect(() => {
     updateFloorSegmentationPreview(
@@ -250,11 +296,13 @@ export function usePcdScene({
       floorSegmentationPreviewRange,
       darkBackground,
     );
-  }, [darkBackground, floorSegmentationEnabled, floorSegmentationPreviewRange]);
+    requestRender();
+  }, [darkBackground, floorSegmentationEnabled, floorSegmentationPreviewRange, requestRender]);
 
   useEffect(() => {
     applyFloorSegmentationRange(pointsRef.current, fullPointDataRef.current, floorSegmentationAppliedRange);
-  }, [floorSegmentationAppliedRange]);
+    requestRender();
+  }, [floorSegmentationAppliedRange, requestRender]);
 
   useEffect(() => {
     if (!onFloorSegmentationPointCountChange) {
@@ -269,20 +317,22 @@ export function usePcdScene({
     if (gridRef.current) {
       gridRef.current.visible = showGrid;
     }
-  }, [showGrid]);
+    requestRender();
+  }, [showGrid, requestRender]);
 
   useEffect(() => {
     if (axesRef.current) {
       axesRef.current.visible = showAxes;
     }
-  }, [showAxes]);
+    requestRender();
+  }, [showAxes, requestRender]);
 
   useEffect(() => {
     if (controlsRef.current) {
-      controlsRef.current.enabled = !taskEditorEnabled;
+      controlsRef.current.enabled = !(taskEditorEnabled || initialPoseEditorEnabled);
     }
 
-    if (!taskEditorEnabled) {
+    if (!(taskEditorEnabled || initialPoseEditorEnabled)) {
       draftTaskStateRef.current = null;
       if (draftTaskMarkerRef.current) {
         draftTaskMarkerRef.current.visible = false;
@@ -291,7 +341,37 @@ export function usePcdScene({
         draftTaskLineRef.current.visible = false;
       }
     }
-  }, [taskEditorEnabled]);
+    requestRender();
+  }, [initialPoseEditorEnabled, taskEditorEnabled, requestRender]);
+
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene) {
+      return;
+    }
+
+    if (!initialPoseSelection) {
+      if (initialPoseMarkerRef.current) {
+        initialPoseMarkerRef.current.visible = false;
+      }
+      return;
+    }
+
+    const markerRadius = Math.max(Math.min(boundsLength(scene) * 0.003, 0.24), 0.07);
+    if (!initialPoseMarkerRef.current) {
+      initialPoseMarkerRef.current = createTaskMarker(markerRadius, "#f59e0b", darkBackgroundRef.current ? "#78350f" : "#fcd34d");
+      scene.add(initialPoseMarkerRef.current);
+    }
+
+    initialPoseMarkerRef.current.position.set(
+      initialPoseSelection.x,
+      initialPoseSelection.y,
+      mapPlaneZRef.current + markerRadius * 0.65,
+    );
+    initialPoseMarkerRef.current.rotation.z = initialPoseSelection.yaw + ROBOT_YAW_OFFSET;
+    initialPoseMarkerRef.current.visible = true;
+    requestRender();
+  }, [fileUrl, initialPoseSelection, requestRender]);
 
   useEffect(() => {
     const scene = sceneRef.current;
@@ -349,7 +429,8 @@ export function usePcdScene({
       taskLineRef.current = line;
       scene.add(line);
     }
-  }, [darkBackground, taskPoints]);
+    requestRender();
+  }, [darkBackground, taskPoints, requestRender]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -365,8 +446,8 @@ export function usePcdScene({
     camera.up.set(0, 0, 1);
     cameraRef.current = camera;
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    const renderer = new THREE.WebGLRenderer({ antialias: performanceProfile.antialias, alpha: false });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, performanceProfile.dprCap));
     renderer.setClearColor(darkBackgroundRef.current ? "#020817" : "#e2e8f0");
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.domElement.tabIndex = 0;
@@ -384,7 +465,7 @@ export function usePcdScene({
     controls.screenSpacePanning = true;
     controls.maxDistance = 3000;
     controls.enableKeys = false;
-    controls.enabled = !taskEditorEnabledRef.current;
+    controls.enabled = !(taskEditorEnabledRef.current || initialPoseEditorEnabledRef.current);
     controlsRef.current = controls;
 
     const ambientLight = new THREE.AmbientLight(0xffffff, 1.3);
@@ -394,8 +475,9 @@ export function usePcdScene({
     directionalLight.position.set(10, -8, 12);
     scene.add(directionalLight);
 
-    void loadOccGridOverlay(scene, mapPlaneZRef.current, showOccGridRef.current).then((mesh) => {
+    void loadOccGridOverlay(scene, mapPlaneZRef.current, showOccGridRef.current, occGridAssetId).then((mesh) => {
       occGridMeshRef.current = mesh;
+      requestRender(1200);
     });
 
     const grid = new THREE.GridHelper(120, 24, 0x5eead4, 0x1e293b);
@@ -417,11 +499,15 @@ export function usePcdScene({
       camera.aspect = width / height;
       camera.updateProjectionMatrix();
       renderer.setSize(width, height, false);
+      requestRender(1200);
     };
 
     resize();
     const observer = new ResizeObserver(resize);
     observer.observe(container);
+    controls.addEventListener("change", () => {
+      requestRender(1200);
+    });
 
     const raycaster = new THREE.Raycaster();
     const mouse = new THREE.Vector2();
@@ -483,7 +569,7 @@ export function usePcdScene({
     const handlePointerDown = (event: PointerEvent) => {
       renderer.domElement.focus();
 
-      if (!taskEditorEnabledRef.current) {
+      if (!taskEditorEnabledRef.current && !initialPoseEditorEnabledRef.current) {
         return;
       }
 
@@ -507,6 +593,7 @@ export function usePcdScene({
       };
       renderer.domElement.setPointerCapture(event.pointerId);
       updateDraftTaskPreview(target, target, taskPointsRef.current.at(-1)?.yaw ?? robotPoseRef.current?.yaw ?? 0, false);
+      requestRender(1200);
     };
 
     const handlePointerMove = (event: PointerEvent) => {
@@ -529,6 +616,7 @@ export function usePcdScene({
         : taskPointsRef.current.at(-1)?.yaw ?? robotPoseRef.current?.yaw ?? 0;
 
       updateDraftTaskPreview(draftState.origin, target, yaw, draftState.hasDirection);
+      requestRender(1200);
     };
 
     const finishDraftTaskPoint = (event: PointerEvent) => {
@@ -550,13 +638,26 @@ export function usePcdScene({
         return;
       }
 
-      const yaw = Math.atan2(target.y - draftState.origin.y, target.x - draftState.origin.x);
-      addTaskPointRef.current({
-        x: Number(draftState.origin.x.toFixed(3)),
-        y: Number(draftState.origin.y.toFixed(3)),
-        z: Number(mapPlaneZRef.current.toFixed(3)),
-        yaw: Number(yaw.toFixed(6)),
-      });
+      if (taskEditorEnabledRef.current) {
+        const yaw = Math.atan2(target.y - draftState.origin.y, target.x - draftState.origin.x);
+        addTaskPointRef.current({
+          x: Number(draftState.origin.x.toFixed(3)),
+          y: Number(draftState.origin.y.toFixed(3)),
+          z: Number(mapPlaneZRef.current.toFixed(3)),
+          yaw: Number(yaw.toFixed(6)),
+        });
+        return;
+      }
+
+      if (initialPoseEditorEnabledRef.current) {
+        const yaw = Math.atan2(target.y - draftState.origin.y, target.x - draftState.origin.x);
+        setInitialPoseRef.current({
+          x: Number(draftState.origin.x.toFixed(3)),
+          y: Number(draftState.origin.y.toFixed(3)),
+          yaw: Number(yaw.toFixed(6)),
+        });
+      }
+      requestRender(1200);
     };
 
     renderer.domElement.addEventListener("pointerdown", handlePointerDown);
@@ -588,10 +689,12 @@ export function usePcdScene({
 
       keysPressedRef.current.add(event.key);
       moveCameraWithKeys(camera, controls, new Set([event.key]), 0.05);
+      requestRender(1200);
     };
 
     const handleKeyUp = (event: KeyboardEvent) => {
       keysPressedRef.current.delete(event.key);
+      requestRender(800);
     };
 
     renderer.domElement.addEventListener("keydown", handleKeyDown);
@@ -623,14 +726,27 @@ export function usePcdScene({
         const size = box.getSize(new THREE.Vector3());
         const min = box.min.clone();
         const max = box.max.clone();
+        const sampledPointData = downsamplePointCloudData(
+          {
+            position: Float32Array.from(position.array as ArrayLike<number>),
+            color: color ? Float32Array.from(color.array as ArrayLike<number>) : null,
+          },
+          performanceProfile.pointBudget,
+        );
 
         pointsRef.current = points;
         scene.add(points);
         floorSegmentationBoundsRef.current = box.clone();
         fullPointDataRef.current = {
-          position: Float32Array.from(position.array as ArrayLike<number>),
-          color: color ? Float32Array.from(color.array as ArrayLike<number>) : null,
+          position: sampledPointData.position,
+          color: sampledPointData.color,
         };
+        points.geometry.setAttribute("position", new THREE.Float32BufferAttribute(sampledPointData.position, 3));
+        if (sampledPointData.color) {
+          points.geometry.setAttribute("color", new THREE.Float32BufferAttribute(sampledPointData.color, 3));
+        } else {
+          points.geometry.deleteAttribute("color");
+        }
         applyFloorSegmentationRange(points, fullPointDataRef.current, floorSegmentationAppliedRangeRef.current);
         onFloorSegmentationPointCountChange?.(
           countPointsInRange(
@@ -744,6 +860,7 @@ export function usePcdScene({
           { x: max.x, y: max.y, z: max.z },
         );
         onStatus("ready");
+        requestRender(2000);
       },
       undefined,
       (error: unknown) => {
@@ -754,15 +871,45 @@ export function usePcdScene({
 
     const clock = new THREE.Clock();
 
+    const scheduleNextFrame = () => {
+      const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+      const isInteracting =
+        keysPressedRef.current.size > 0 ||
+        draftTaskStateRef.current !== null ||
+        now < interactionUntilRef.current;
+      if (isInteracting) {
+        idleTimerRef.current = window.setTimeout(() => {
+          idleTimerRef.current = null;
+          frameRef.current = window.requestAnimationFrame(animate);
+        }, Math.max(1000 / performanceProfile.maxRenderFps, 16));
+        return;
+      }
+      idleTimerRef.current = window.setTimeout(() => {
+        idleTimerRef.current = null;
+        frameRef.current = window.requestAnimationFrame(animate);
+      }, Math.max(1000 / performanceProfile.idleFps, 16));
+    };
+
     const animate = () => {
       const keys = keysPressedRef.current;
       if (keys.size > 0) {
         moveCameraWithKeys(camera, controls, keys, Math.min(clock.getDelta(), 0.1));
+        requestRender(1200);
+      } else {
+        clock.getDelta();
       }
 
       controls.update();
-      renderer.render(scene, camera);
-      frameRef.current = window.requestAnimationFrame(animate);
+      const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+      const isInteracting =
+        keys.size > 0 ||
+        draftTaskStateRef.current !== null ||
+        now < interactionUntilRef.current;
+      if (renderRequestedRef.current || isInteracting) {
+        renderer.render(scene, camera);
+        renderRequestedRef.current = false;
+      }
+      scheduleNextFrame();
     };
     animate();
 
@@ -786,8 +933,27 @@ export function usePcdScene({
         }
         occGridMeshRef.current = null;
       }
+      if (initialPoseMarkerRef.current) {
+        scene.remove(initialPoseMarkerRef.current);
+        initialPoseMarkerRef.current.traverse((child) => {
+          const mesh = child as THREE.Mesh;
+          if (mesh.geometry) {
+            mesh.geometry.dispose();
+          }
+          const material = mesh.material;
+          if (Array.isArray(material)) {
+            material.forEach((item) => item.dispose());
+          } else if (material instanceof THREE.Material) {
+            material.dispose();
+          }
+        });
+        initialPoseMarkerRef.current = null;
+      }
       if (frameRef.current !== null) {
         cancelAnimationFrame(frameRef.current);
+      }
+      if (idleTimerRef.current !== null) {
+        window.clearTimeout(idleTimerRef.current);
       }
       fullPointDataRef.current = null;
       floorSegmentationBoundsRef.current = null;
@@ -796,7 +962,7 @@ export function usePcdScene({
       scene.clear();
       container.removeChild(renderer.domElement);
     };
-  }, [fileUrl, onSceneReady, onStatus, resetView]);
+  }, [fileUrl, occGridAssetId, onSceneReady, onStatus, performanceProfile, requestRender, resetView]);
 
   return {
     containerRef,
@@ -806,8 +972,13 @@ export function usePcdScene({
   };
 }
 
-async function loadOccGridOverlay(scene: THREE.Scene, planeZ: number, visible: boolean) {
-  const metaResponse = await fetch("/api/map/occ-grid/meta", {
+async function loadOccGridOverlay(scene: THREE.Scene, planeZ: number, visible: boolean, occGridAssetId: string | null) {
+  if (!occGridAssetId) {
+    return null;
+  }
+
+  const requestQuery = `pcdId=${encodeURIComponent(occGridAssetId)}`;
+  const metaResponse = await fetch(`/api/map/occ-grid/meta?${requestQuery}`, {
     method: "GET",
     headers: {
       Accept: "application/json",
@@ -825,7 +996,7 @@ async function loadOccGridOverlay(scene: THREE.Scene, planeZ: number, visible: b
     return null;
   }
 
-  const imageResponse = await fetch("/api/map/occ-grid/image");
+  const imageResponse = await fetch(`/api/map/occ-grid/image?${requestQuery}`);
   if (!imageResponse.ok) {
     return null;
   }
