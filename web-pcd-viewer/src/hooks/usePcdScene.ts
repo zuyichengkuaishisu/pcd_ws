@@ -118,6 +118,7 @@ export function usePcdScene({
   const mapPlaneZRef = useRef(mapPlaneZ);
   const addTaskPointRef = useRef(onAddTaskPoint);
   const draftTaskStateRef = useRef<DraftTaskPointerState | null>(null);
+  const keysPressedRef = useRef(new Set<string>());
 
   useEffect(() => {
     pointSizeRef.current = pointSize;
@@ -368,7 +369,13 @@ export function usePcdScene({
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.setClearColor(darkBackgroundRef.current ? "#020817" : "#e2e8f0");
     renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.domElement.tabIndex = 0;
+    renderer.domElement.style.outline = "none";
+    renderer.domElement.setAttribute("aria-label", "PCD 点云画布");
     container.appendChild(renderer.domElement);
+    window.setTimeout(() => {
+      renderer.domElement.focus();
+    }, 0);
     rendererRef.current = renderer;
 
     const controls = new OrbitControls(camera, renderer.domElement);
@@ -376,6 +383,7 @@ export function usePcdScene({
     controls.dampingFactor = 0.08;
     controls.screenSpacePanning = true;
     controls.maxDistance = 3000;
+    controls.enableKeys = false;
     controls.enabled = !taskEditorEnabledRef.current;
     controlsRef.current = controls;
 
@@ -473,6 +481,8 @@ export function usePcdScene({
     };
 
     const handlePointerDown = (event: PointerEvent) => {
+      renderer.domElement.focus();
+
       if (!taskEditorEnabledRef.current) {
         return;
       }
@@ -553,6 +563,39 @@ export function usePcdScene({
     renderer.domElement.addEventListener("pointermove", handlePointerMove);
     renderer.domElement.addEventListener("pointerup", finishDraftTaskPoint);
     renderer.domElement.addEventListener("pointercancel", finishDraftTaskPoint);
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) {
+        return;
+      }
+
+      if (
+        event.key === "ArrowUp" ||
+        event.key === "ArrowDown" ||
+        event.key === "ArrowLeft" ||
+        event.key === "ArrowRight" ||
+        event.key === "w" ||
+        event.key === "W" ||
+        event.key === "a" ||
+        event.key === "A" ||
+        event.key === "s" ||
+        event.key === "S" ||
+        event.key === "d" ||
+        event.key === "D"
+      ) {
+        event.preventDefault();
+      }
+
+      keysPressedRef.current.add(event.key);
+      moveCameraWithKeys(camera, controls, new Set([event.key]), 0.05);
+    };
+
+    const handleKeyUp = (event: KeyboardEvent) => {
+      keysPressedRef.current.delete(event.key);
+    };
+
+    renderer.domElement.addEventListener("keydown", handleKeyDown);
+    renderer.domElement.addEventListener("keyup", handleKeyUp);
 
     onStatus("loading");
     const loader = new PCDLoader();
@@ -709,7 +752,14 @@ export function usePcdScene({
       },
     );
 
+    const clock = new THREE.Clock();
+
     const animate = () => {
+      const keys = keysPressedRef.current;
+      if (keys.size > 0) {
+        moveCameraWithKeys(camera, controls, keys, Math.min(clock.getDelta(), 0.1));
+      }
+
       controls.update();
       renderer.render(scene, camera);
       frameRef.current = window.requestAnimationFrame(animate);
@@ -722,6 +772,8 @@ export function usePcdScene({
       renderer.domElement.removeEventListener("pointermove", handlePointerMove);
       renderer.domElement.removeEventListener("pointerup", finishDraftTaskPoint);
       renderer.domElement.removeEventListener("pointercancel", finishDraftTaskPoint);
+      renderer.domElement.removeEventListener("keydown", handleKeyDown);
+      renderer.domElement.removeEventListener("keyup", handleKeyUp);
       if (occGridMeshRef.current) {
         scene.remove(occGridMeshRef.current);
         occGridMeshRef.current.geometry.dispose();
@@ -860,6 +912,41 @@ function createTaskMarker(
 function setLinePositions(geometry: THREE.BufferGeometry, positions: number[]) {
   geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
   geometry.computeBoundingSphere();
+}
+
+function moveCameraWithKeys(
+  camera: THREE.PerspectiveCamera,
+  controls: OrbitControls,
+  keys: Set<string>,
+  delta: number,
+) {
+  const forward = new THREE.Vector3().subVectors(controls.target, camera.position);
+  forward.z = 0;
+  const dist = forward.length();
+  if (dist <= 0.001) {
+    return;
+  }
+
+  forward.normalize();
+  const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0, 0, 1));
+  const speed = dist * delta * 0.6;
+
+  if (keys.has("ArrowUp") || keys.has("w") || keys.has("W")) {
+    camera.position.addScaledVector(forward, speed);
+    controls.target.addScaledVector(forward, speed);
+  }
+  if (keys.has("ArrowDown") || keys.has("s") || keys.has("S")) {
+    camera.position.addScaledVector(forward, -speed);
+    controls.target.addScaledVector(forward, -speed);
+  }
+  if (keys.has("ArrowLeft") || keys.has("a") || keys.has("A")) {
+    camera.position.addScaledVector(right, speed);
+    controls.target.addScaledVector(right, speed);
+  }
+  if (keys.has("ArrowRight") || keys.has("d") || keys.has("D")) {
+    camera.position.addScaledVector(right, -speed);
+    controls.target.addScaledVector(right, -speed);
+  }
 }
 
 function applyFloorSegmentationRange(

@@ -204,29 +204,42 @@ export M20_MAPPING_PORT=30100
 
 ```
 open-inspection-platform/
-├── web-pcd-viewer/          # 主前端工程
+├── web-pcd-viewer/                  # 主前端工程
 │   ├── src/
+│   │   ├── components/              # 通用 UI 组件
+│   │   │   ├── ControlButton.tsx
+│   │   │   ├── MetricCard.tsx
+│   │   │   └── ToggleChip.tsx
+│   │   ├── hooks/
+│   │   │   ├── usePcdScene.ts       # Three.js 场景与交互
+│   │   │   └── useRobotPosePolling.ts  # 位姿轮询
+│   │   ├── lib/utils.ts             # 通用工具函数
 │   │   ├── pages/Home.tsx           # 主页面与控制逻辑
-│   │   ├── hooks/usePcdScene.ts     # Three.js 场景与交互
-│   │   ├── hooks/useRobotPosePolling.ts  # 位姿轮询
 │   │   ├── store/useViewerStore.ts  # 全局状态
-│   │   └── types/navigation.ts      # 任务点与导航类型
+│   │   ├── types/navigation.ts      # 任务点与导航类型
+│   │   ├── utils/viewerFormat.ts    # 格式化工具
+│   │   ├── App.tsx                  # 根组件
+│   │   └── main.tsx                 # 入口文件
 │   ├── api/m20RobotProtocol.ts      # M20 协议封装
-│   └── vite.config.ts               # API 中间件与路由
+│   ├── index.html
+│   ├── package.json
+│   ├── vite.config.ts               # API 中间件与路由
+│   └── tsconfig.json
 ├── data/
 │   ├── maps/siteB-20260616-105415/  # 完整地图资产
 │   │   ├── full_cloud.pcd
 │   │   ├── occ_grid.pgm
 │   │   └── occ_grid.yaml
 │   └── pcd_samples/                 # 测试点云样例
-├── Dockerfile               # 容器镜像定义
-├── docker-compose.yml       # 容器编排
-├── .env.example             # 配置模板
-├── start-docker.sh          # 一键启动脚本
-├── stop-docker.sh           # 一键停止脚本
+├── pic/                             # 截图与图片资源
+├── Dockerfile                       # 容器镜像定义
+├── docker-compose.yml               # 容器编排
+├── .dockerignore
+├── .env.example                     # 配置模板
+├── start-docker.sh                  # 一键启动脚本
+├── stop-docker.sh                   # 一键停止脚本
 ├── m20_robot_monitoring_protocol.md   # 机器人协议文档
-├── m20_mapping_udp_protocol.md        # 建图协议文档
-└── pcd_transformer.py       # PCD 离线转图工具
+└── m20_mapping_udp_protocol.md      # 建图协议文档
 ```
 
 ---

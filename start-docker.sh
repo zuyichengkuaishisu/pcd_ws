@@ -32,6 +32,7 @@ if [[ ! -f "$ROOT_DIR/.env" && -f "$ROOT_DIR/.env.example" ]]; then
 fi
 
 echo "Starting Open Inspection Platform with Docker..."
+"${COMPOSE_CMD[@]}" -f "$ROOT_DIR/docker-compose.yml" down --remove-orphans 2>/dev/null || true
 "${COMPOSE_CMD[@]}" -f "$ROOT_DIR/docker-compose.yml" up -d --build
 
 APP_PORT="${APP_PORT:-4174}"
