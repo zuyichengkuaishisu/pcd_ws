@@ -54,7 +54,30 @@ export type NavigationTaskResponse = {
   port: number;
 };
 
+export type ProtocolAckResponse = {
+  errorCode: number;
+  timestamp: string;
+  host: string;
+  port: number;
+};
+
+export type FireAndForgetCommandResponse = {
+  timestamp: string;
+  host: string;
+  port: number;
+};
+
+export type RobotAxisControlPayload = {
+  x: number;
+  y: number;
+  z: number;
+  roll: number;
+  pitch: number;
+  yaw: number;
+};
+
 export type RobotChargeAction = 0 | 1;
+export type RobotMotionAction = 0 | 1 | 2 | 3 | 4 | 17;
 
 export type RobotChargeResponse = {
   errorCode: number;
@@ -261,6 +284,21 @@ function parseNavigationTaskResponse(payload: Buffer, host: string, port: number
   };
 }
 
+function parseProtocolAckResponse(payload: Buffer, host: string, port: number, fallbackMessage: string): ProtocolAckResponse {
+  const parsed = JSON.parse(payload.toString("utf-8")) as PatrolDeviceEnvelope;
+  const items = parsed.PatrolDevice?.Items;
+  if (!items) {
+    throw new Error(`${fallbackMessage}响应缺少 Items 字段`);
+  }
+
+  return {
+    errorCode: Number(items.ErrorCode),
+    timestamp: parsed.PatrolDevice?.Time ?? "",
+    host,
+    port,
+  };
+}
+
 function parseRobotChargeResponse(
   payload: Buffer,
   host: string,
@@ -369,6 +407,40 @@ async function sendPatrolJsonRequest(
 
     const payload = frame.subarray(16, 16 + asduLength);
     return payload;
+  } finally {
+    socket.destroy();
+  }
+}
+
+async function sendPatrolJsonCommand(host: string, port: number, body: PatrolDeviceEnvelope, timeoutMs = 3000) {
+  const socket = new net.Socket();
+  socket.setTimeout(timeoutMs);
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const onError = (error: Error) => {
+        cleanup();
+        reject(error);
+      };
+      const onTimeout = () => {
+        cleanup();
+        reject(new Error("机器人发送超时"));
+      };
+      const cleanup = () => {
+        socket.off("error", onError);
+        socket.off("timeout", onTimeout);
+      };
+
+      socket.on("error", onError);
+      socket.on("timeout", onTimeout);
+      socket.connect(port, host, () => {
+        const packet = buildJsonPacket(nextMessageId(), body);
+        socket.end(packet, () => {
+          cleanup();
+          resolve();
+        });
+      });
+    });
   } finally {
     socket.destroy();
   }
@@ -525,6 +597,23 @@ export async function submitNavigationTask(
   return parseNavigationTaskResponse(payload, host, port);
 }
 
+export async function cancelNavigationTask(host: string, port: number, timeoutMs = 7000) {
+  const payload = await sendPatrolJsonRequest(
+    host,
+    port,
+    {
+      PatrolDevice: {
+        Type: 1004,
+        Command: 1,
+        Time: formatProtocolTime(),
+        Items: {},
+      },
+    },
+    timeoutMs,
+  );
+  return parseProtocolAckResponse(payload, host, port, "取消导航任务");
+}
+
 export async function submitRobotChargeAction(
   host: string,
   port: number,
@@ -547,6 +636,64 @@ export async function submitRobotChargeAction(
     timeoutMs,
   );
   return parseRobotChargeResponse(payload, host, port, charge);
+}
+
+export async function submitRobotMotionAction(
+  host: string,
+  port: number,
+  motion: RobotMotionAction,
+  timeoutMs = 7000,
+) {
+  const payload = await sendPatrolJsonRequest(
+    host,
+    port,
+    {
+      PatrolDevice: {
+        Type: 2,
+        Command: 22,
+        Time: formatProtocolTime(),
+        Items: {
+          MotionParam: motion,
+        },
+      },
+    },
+    timeoutMs,
+  );
+  return parseProtocolAckResponse(payload, host, port, "运动状态转换");
+}
+
+export async function submitRobotAxisControl(
+  host: string,
+  port: number,
+  command: RobotAxisControlPayload,
+  timeoutMs = 3000,
+): Promise<FireAndForgetCommandResponse> {
+  const timestamp = formatProtocolTime();
+  await sendPatrolJsonCommand(
+    host,
+    port,
+    {
+      PatrolDevice: {
+        Type: 2,
+        Command: 21,
+        Time: timestamp,
+        Items: {
+          X: command.x,
+          Y: command.y,
+          Z: command.z,
+          Roll: command.roll,
+          Pitch: command.pitch,
+          Yaw: command.yaw,
+        },
+      },
+    },
+    timeoutMs,
+  );
+  return {
+    timestamp,
+    host,
+    port,
+  };
 }
 
 export async function startMapping(

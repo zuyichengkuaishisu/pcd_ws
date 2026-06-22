@@ -10,18 +10,23 @@ import { traeBadgePlugin } from 'vite-plugin-trae-solo-badge';
 
 import {
   applyNavigationMap,
+  cancelNavigationTask,
   listLocalMaps,
   requestMappingStatus,
   requestRobotPose,
   requestNavigationTaskStatus,
   startMapping,
   stopMapping,
+  submitRobotAxisControl,
   submitInitialPoseEstimate,
   submitNavigationTask,
   submitRobotChargeAction,
+  submitRobotMotionAction,
   type MappingStartPayload,
   type NavigationTaskPayload,
+  type RobotAxisControlPayload,
   type RobotChargeAction,
+  type RobotMotionAction,
 } from "./api/m20RobotProtocol";
 
 const ROBOT_HOST = process.env.M20_ROBOT_HOST ?? "10.21.31.103";
@@ -498,6 +503,35 @@ function createNavigationTaskStatusHandler(): ApiHandler {
   };
 }
 
+function createNavigationTaskCancelHandler(): ApiHandler {
+  return async (req, res) => {
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+
+    if (req.method !== "POST") {
+      res.statusCode = 405;
+      res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
+      return;
+    }
+
+    try {
+      const response = await cancelNavigationTask(ROBOT_HOST, ROBOT_PORT);
+      res.statusCode = 200;
+      res.end(JSON.stringify({ ok: true, ...response }));
+    } catch (error) {
+      res.statusCode = 502;
+      res.end(
+        JSON.stringify({
+          ok: false,
+          error: error instanceof Error ? error.message : "取消导航任务失败",
+          host: ROBOT_HOST,
+          port: ROBOT_PORT,
+        }),
+      );
+    }
+  };
+}
+
 function createRobotChargeHandler(): ApiHandler {
   return async (req, res) => {
     res.setHeader("Content-Type", "application/json; charset=utf-8");
@@ -527,6 +561,90 @@ function createRobotChargeHandler(): ApiHandler {
         JSON.stringify({
           ok: false,
           error: error instanceof Error ? error.message : "自主充电指令下发失败",
+          host: ROBOT_HOST,
+          port: ROBOT_PORT,
+        }),
+      );
+    }
+  };
+}
+
+function createRobotSoftEstopHandler(): ApiHandler {
+  return async (req, res) => {
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+
+    if (req.method !== "POST") {
+      res.statusCode = 405;
+      res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
+      return;
+    }
+
+    try {
+      const body = await readJsonBody(req);
+      const motion = Number(body.motion ?? 2) as RobotMotionAction;
+      if (![0, 1, 2, 3, 4, 17].includes(motion)) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ ok: false, error: "运动状态参数无效，仅支持 `0/1/2/3/4/17`" }));
+        return;
+      }
+
+      const response = await submitRobotMotionAction(ROBOT_HOST, ROBOT_PORT, motion);
+      res.statusCode = 200;
+      res.end(JSON.stringify({ ok: true, ...response, motion }));
+    } catch (error) {
+      res.statusCode = 502;
+      res.end(
+        JSON.stringify({
+          ok: false,
+          error: error instanceof Error ? error.message : "软急停下发失败",
+          host: ROBOT_HOST,
+          port: ROBOT_PORT,
+        }),
+      );
+    }
+  };
+}
+
+function createRobotAxisControlHandler(): ApiHandler {
+  return async (req, res) => {
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+
+    if (req.method !== "POST") {
+      res.statusCode = 405;
+      res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
+      return;
+    }
+
+    try {
+      const body = await readJsonBody(req);
+      const command: RobotAxisControlPayload = {
+        x: Number(body.x ?? 0),
+        y: Number(body.y ?? 0),
+        z: Number(body.z ?? 0),
+        roll: Number(body.roll ?? 0),
+        pitch: Number(body.pitch ?? 0),
+        yaw: Number(body.yaw ?? 0),
+      };
+
+      const values = Object.values(command);
+      const hasInvalidValue = values.some((value) => Number.isNaN(value) || value < -1 || value > 1);
+      if (hasInvalidValue) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ ok: false, error: "轴指令参数无效，需要 `[-1,1]` 范围内的 x/y/z/roll/pitch/yaw 数值" }));
+        return;
+      }
+
+      const response = await submitRobotAxisControl(ROBOT_HOST, ROBOT_PORT, command);
+      res.statusCode = 200;
+      res.end(JSON.stringify({ ok: true, ...response, command }));
+    } catch (error) {
+      res.statusCode = 502;
+      res.end(
+        JSON.stringify({
+          ok: false,
+          error: error instanceof Error ? error.message : "轴指令下发失败",
           host: ROBOT_HOST,
           port: ROBOT_PORT,
         }),
@@ -847,7 +965,10 @@ function robotPoseApiPlugin() {
   const initialPoseHandler = createInitialPoseHandler();
   const navigationTaskHandler = createNavigationTaskHandler();
   const navigationTaskStatusHandler = createNavigationTaskStatusHandler();
+  const navigationTaskCancelHandler = createNavigationTaskCancelHandler();
   const robotChargeHandler = createRobotChargeHandler();
+  const robotSoftEstopHandler = createRobotSoftEstopHandler();
+  const robotAxisControlHandler = createRobotAxisControlHandler();
   const occGridMetaHandler = createOccGridMetaHandler();
   const occGridImageHandler = createOccGridImageHandler();
   const pcdHandler = createPcdHandler();
@@ -866,7 +987,10 @@ function robotPoseApiPlugin() {
       server.middlewares.use("/api/robot/initial-pose", initialPoseHandler);
       server.middlewares.use("/api/robot/navigation-task", navigationTaskHandler);
       server.middlewares.use("/api/robot/navigation-task-status", navigationTaskStatusHandler);
+      server.middlewares.use("/api/robot/navigation-task-cancel", navigationTaskCancelHandler);
       server.middlewares.use("/api/robot/charge", robotChargeHandler);
+      server.middlewares.use("/api/robot/soft-estop", robotSoftEstopHandler);
+      server.middlewares.use("/api/robot/axis-control", robotAxisControlHandler);
       server.middlewares.use("/api/mapping/status", mappingStatusHandler);
       server.middlewares.use("/api/mapping/start", mappingStartHandler);
       server.middlewares.use("/api/mapping/stop", mappingStopHandler);
@@ -883,7 +1007,10 @@ function robotPoseApiPlugin() {
       server.middlewares.use("/api/robot/initial-pose", initialPoseHandler);
       server.middlewares.use("/api/robot/navigation-task", navigationTaskHandler);
       server.middlewares.use("/api/robot/navigation-task-status", navigationTaskStatusHandler);
+      server.middlewares.use("/api/robot/navigation-task-cancel", navigationTaskCancelHandler);
       server.middlewares.use("/api/robot/charge", robotChargeHandler);
+      server.middlewares.use("/api/robot/soft-estop", robotSoftEstopHandler);
+      server.middlewares.use("/api/robot/axis-control", robotAxisControlHandler);
       server.middlewares.use("/api/mapping/status", mappingStatusHandler);
       server.middlewares.use("/api/mapping/start", mappingStartHandler);
       server.middlewares.use("/api/mapping/stop", mappingStopHandler);

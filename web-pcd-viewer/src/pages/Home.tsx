@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Aperture,
   Box,
   Crosshair,
   Grid2x2,
+  Hand,
   ListOrdered,
   LocateFixed,
   MoonStar,
@@ -44,6 +45,9 @@ const DEFAULT_NAVIGATION_TASK = {
   ObsMode: 0,
   NavMode: 1,
 } as const;
+const TELEOP_LINEAR_RATIO = 0.35;
+const TELEOP_YAW_RATIO = 0.45;
+const TELEOP_SUPPORTED_KEYS = new Set(["w", "x", "a", "d", "q", "e"]);
 
 type NavigationRuntimeState = {
   connection: "idle" | "loading" | "ready" | "error";
@@ -95,6 +99,77 @@ type PcdMapItem = {
 };
 
 const DEFAULT_PCD_URL = `/api/map/pcd/${encodeURIComponent("sample:outside_15cm_simpled.pcd")}`;
+type TeleopAxisPayload = {
+  x: number;
+  y: number;
+  z: number;
+  roll: number;
+  pitch: number;
+  yaw: number;
+};
+
+const ZERO_TELEOP_AXIS_PAYLOAD: TeleopAxisPayload = {
+  x: 0,
+  y: 0,
+  z: 0,
+  roll: 0,
+  pitch: 0,
+  yaw: 0,
+};
+
+function normalizeTeleopKey(key: string) {
+  const normalized = key.toLowerCase();
+  return TELEOP_SUPPORTED_KEYS.has(normalized) ? normalized : null;
+}
+
+function serializeTeleopAxisPayload(payload: TeleopAxisPayload) {
+  return `${payload.x}|${payload.y}|${payload.z}|${payload.roll}|${payload.pitch}|${payload.yaw}`;
+}
+
+function isZeroTeleopAxisPayload(payload: TeleopAxisPayload) {
+  return serializeTeleopAxisPayload(payload) === serializeTeleopAxisPayload(ZERO_TELEOP_AXIS_PAYLOAD);
+}
+
+function buildTeleopAxisPayload(keys: Set<string>): TeleopAxisPayload {
+  let x = 0;
+  let y = 0;
+  let yaw = 0;
+
+  if (keys.has("w")) {
+    x += TELEOP_LINEAR_RATIO;
+  }
+  if (keys.has("x")) {
+    x -= TELEOP_LINEAR_RATIO;
+  }
+  if (keys.has("a")) {
+    y += TELEOP_LINEAR_RATIO;
+  }
+  if (keys.has("d")) {
+    y -= TELEOP_LINEAR_RATIO;
+  }
+  if (keys.has("q")) {
+    yaw += TELEOP_YAW_RATIO;
+  }
+  if (keys.has("e")) {
+    yaw -= TELEOP_YAW_RATIO;
+  }
+
+  return {
+    x,
+    y,
+    z: 0,
+    roll: 0,
+    pitch: 0,
+    yaw,
+  };
+}
+
+function formatTeleopAxisMessage(payload: TeleopAxisPayload, timestamp: string | null) {
+  if (isZeroTeleopAxisPayload(payload)) {
+    return `已发送停止轴指令，时间 ${timestamp || "-"}。`;
+  }
+  return `轴指令已发送：X=${payload.x.toFixed(2)}，Y=${payload.y.toFixed(2)}，Yaw=${payload.yaw.toFixed(2)}，时间 ${timestamp || "-"}`;
+}
 
 export default function Home() {
   const {
@@ -150,6 +225,11 @@ export default function Home() {
   const [chargeActionStatus, setChargeActionStatus] = useState<"idle" | "submitting" | "success" | "error">("idle");
   const [chargeActionMessage, setChargeActionMessage] = useState("手动触发开始充电或结束充电。");
   const [robotChargeState, setRobotChargeState] = useState<"unknown" | "idle" | "charging">("unknown");
+  const [navControlStatus, setNavControlStatus] = useState<"idle" | "submitting" | "success" | "error">("idle");
+  const [navControlMessage, setNavControlMessage] = useState("可在顶端快速取消导航任务，或立即下发软急停。");
+  const [teleopEnabled, setTeleopEnabled] = useState(false);
+  const [teleopStatus, setTeleopStatus] = useState<"idle" | "submitting" | "success" | "error">("idle");
+  const [teleopMessage, setTeleopMessage] = useState("键盘控狗已关闭。开启后使用 W/X/A/D/Q/E 控制机器人移动与偏航。");
   const [showOccGrid, setShowOccGrid] = useState(false);
   const [mappingForm, setMappingForm] = useState({
     mapName: "",
@@ -182,6 +262,9 @@ export default function Home() {
     timestamp: "",
     message: "等待查询导航状态",
   });
+  const teleopPressedKeysRef = useRef(new Set<string>());
+  const teleopSendingRef = useRef(false);
+  const teleopLastSignatureRef = useRef(serializeTeleopAxisPayload(ZERO_TELEOP_AXIS_PAYLOAD));
   const performanceProfile = useMemo(() => resolvePerformanceProfile("auto"), []);
   const selectedPcdItem = useMemo(
     () => pcdItems.find((item) => item.id === selectedPcdId) ?? null,
@@ -207,6 +290,7 @@ export default function Home() {
     fileUrl: selectedPcdUrl,
     occGridAssetId: selectedPcdItem?.hasLinkedOccGrid ? selectedPcdItem.id : null,
     performanceProfile,
+    keyboardCameraEnabled: !teleopEnabled,
     pointSize,
     pointShape,
     showGrid,
@@ -406,6 +490,32 @@ export default function Home() {
     }
     return "border-amber-300/40 bg-amber-300/10 text-amber-100";
   }, [chargeActionStatus]);
+
+  const navControlTone = useMemo(() => {
+    if (navControlStatus === "error") {
+      return "border-rose-400/40 bg-rose-400/10 text-rose-100";
+    }
+    if (navControlStatus === "success") {
+      return "border-emerald-400/40 bg-emerald-400/10 text-emerald-100";
+    }
+    if (navControlStatus === "submitting") {
+      return "border-cyan-300/40 bg-cyan-300/10 text-cyan-100";
+    }
+    return "border-white/10 bg-white/[0.03] text-slate-300";
+  }, [navControlStatus]);
+
+  const teleopTone = useMemo(() => {
+    if (teleopStatus === "error") {
+      return "border-rose-400/40 bg-rose-400/10 text-rose-100";
+    }
+    if (teleopStatus === "success") {
+      return "border-emerald-400/40 bg-emerald-400/10 text-emerald-100";
+    }
+    if (teleopStatus === "submitting") {
+      return "border-cyan-300/40 bg-cyan-300/10 text-cyan-100";
+    }
+    return "border-white/10 bg-white/[0.03] text-slate-300";
+  }, [teleopStatus]);
 
   const floorSegmentationRange = useMemo(() => {
     if (floorSegmentationDraftRange) {
@@ -688,6 +798,245 @@ export default function Home() {
     } catch (error) {
       setChargeActionStatus("error");
       setChargeActionMessage(error instanceof Error ? error.message : "自主充电指令下发失败");
+    }
+  };
+
+  const submitTeleopAxisControl = useCallback(async (payload: TeleopAxisPayload) => {
+    if (teleopSendingRef.current) {
+      return;
+    }
+
+    teleopSendingRef.current = true;
+    setTeleopStatus("submitting");
+
+    try {
+      const response = await fetch("/api/robot/axis-control", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+
+      const result = (await response.json()) as {
+        ok: boolean;
+        error?: string;
+        timestamp?: string;
+      };
+
+      if (!response.ok || !result.ok) {
+        throw new Error(result.error || `轴指令下发失败: HTTP ${response.status}`);
+      }
+
+      setTeleopStatus("success");
+      setTeleopMessage(formatTeleopAxisMessage(payload, result.timestamp ?? null));
+    } catch (error) {
+      setTeleopStatus("error");
+      setTeleopMessage(error instanceof Error ? error.message : "轴指令下发失败");
+    } finally {
+      teleopSendingRef.current = false;
+    }
+  }, []);
+
+  const syncTeleopAxisControl = useCallback(
+    (force = false) => {
+      const payload = buildTeleopAxisPayload(teleopPressedKeysRef.current);
+      const signature = serializeTeleopAxisPayload(payload);
+      const zeroSignature = serializeTeleopAxisPayload(ZERO_TELEOP_AXIS_PAYLOAD);
+
+      if (!force && signature === zeroSignature && signature === teleopLastSignatureRef.current) {
+        return;
+      }
+
+      teleopLastSignatureRef.current = signature;
+      void submitTeleopAxisControl(payload);
+    },
+    [submitTeleopAxisControl],
+  );
+
+  useEffect(() => {
+    if (!teleopEnabled) {
+      const hadMotion = teleopLastSignatureRef.current !== serializeTeleopAxisPayload(ZERO_TELEOP_AXIS_PAYLOAD);
+      teleopPressedKeysRef.current.clear();
+      teleopLastSignatureRef.current = serializeTeleopAxisPayload(ZERO_TELEOP_AXIS_PAYLOAD);
+      setTeleopStatus("idle");
+      setTeleopMessage("键盘控狗已关闭。开启后使用 W/X/A/D/Q/E 控制机器人移动与偏航，仅常规模式生效。");
+      if (hadMotion) {
+        void submitTeleopAxisControl(ZERO_TELEOP_AXIS_PAYLOAD);
+      }
+      return;
+    }
+
+    setTeleopStatus("success");
+    setTeleopMessage("键盘控狗已开启：W前进，X后退，A左移，D右移，Q左转，E右转。仅常规模式生效。");
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.target instanceof HTMLInputElement ||
+        event.target instanceof HTMLTextAreaElement ||
+        event.target instanceof HTMLSelectElement ||
+        (event.target instanceof HTMLElement && event.target.isContentEditable)
+      ) {
+        return;
+      }
+
+      const key = normalizeTeleopKey(event.key);
+      if (!key) {
+        return;
+      }
+
+      event.preventDefault();
+      teleopPressedKeysRef.current.add(key);
+      syncTeleopAxisControl(true);
+    };
+
+    const handleKeyUp = (event: KeyboardEvent) => {
+      const key = normalizeTeleopKey(event.key);
+      if (!key) {
+        return;
+      }
+
+      event.preventDefault();
+      teleopPressedKeysRef.current.delete(key);
+      syncTeleopAxisControl(true);
+    };
+
+    const handleBlur = () => {
+      teleopPressedKeysRef.current.clear();
+      syncTeleopAxisControl(true);
+    };
+
+    const timer = window.setInterval(() => {
+      if (teleopPressedKeysRef.current.size === 0) {
+        return;
+      }
+      syncTeleopAxisControl(false);
+    }, 120);
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    window.addEventListener("blur", handleBlur);
+
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+      window.removeEventListener("blur", handleBlur);
+      if (teleopPressedKeysRef.current.size > 0) {
+        teleopPressedKeysRef.current.clear();
+        teleopLastSignatureRef.current = serializeTeleopAxisPayload(ZERO_TELEOP_AXIS_PAYLOAD);
+        void submitTeleopAxisControl(ZERO_TELEOP_AXIS_PAYLOAD);
+      }
+    };
+  }, [syncTeleopAxisControl, submitTeleopAxisControl, teleopEnabled]);
+
+  const handleCancelNavigationTask = async () => {
+    setNavControlStatus("submitting");
+    setNavControlMessage("正在下发取消导航任务指令。");
+
+    try {
+      const response = await fetch("/api/robot/navigation-task-cancel", {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+        },
+      });
+
+      const result = (await response.json()) as {
+        ok: boolean;
+        error?: string;
+        errorCode?: number;
+        timestamp?: string;
+      };
+
+      if (!response.ok || !result.ok) {
+        throw new Error(result.error || `取消导航任务失败: HTTP ${response.status}`);
+      }
+
+      if ((result.errorCode ?? 0) !== 0) {
+        throw new Error(`取消导航任务返回 ErrorCode=${result.errorCode}`);
+      }
+
+      setNavControlStatus("success");
+      setNavControlMessage(`已下发取消导航任务，返回时间 ${result.timestamp || "-"}`);
+    } catch (error) {
+      setNavControlStatus("error");
+      setNavControlMessage(error instanceof Error ? error.message : "取消导航任务失败");
+    }
+  };
+
+  const handleSoftEstop = async () => {
+    setNavControlStatus("submitting");
+    setNavControlMessage("正在下发软急停指令（MotionParam=2）。");
+
+    try {
+      const response = await fetch("/api/robot/soft-estop", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({ motion: 2 }),
+      });
+
+      const result = (await response.json()) as {
+        ok: boolean;
+        error?: string;
+        errorCode?: number;
+        timestamp?: string;
+      };
+
+      if (!response.ok || !result.ok) {
+        throw new Error(result.error || `软急停下发失败: HTTP ${response.status}`);
+      }
+
+      if ((result.errorCode ?? 0) !== 0) {
+        throw new Error(`软急停返回 ErrorCode=${result.errorCode}`);
+      }
+
+      setNavControlStatus("success");
+      setNavControlMessage(`软急停已下发，返回时间 ${result.timestamp || "-"}`);
+    } catch (error) {
+      setNavControlStatus("error");
+      setNavControlMessage(error instanceof Error ? error.message : "软急停下发失败");
+    }
+  };
+
+  const handleRecoverStand = async () => {
+    setNavControlStatus("submitting");
+    setNavControlMessage("正在下发恢复站立指令（MotionParam=1）。");
+
+    try {
+      const response = await fetch("/api/robot/soft-estop", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({ motion: 1 }),
+      });
+
+      const result = (await response.json()) as {
+        ok: boolean;
+        error?: string;
+        errorCode?: number;
+        timestamp?: string;
+      };
+
+      if (!response.ok || !result.ok) {
+        throw new Error(result.error || `恢复站立下发失败: HTTP ${response.status}`);
+      }
+
+      if ((result.errorCode ?? 0) !== 0) {
+        throw new Error(`恢复站立返回 ErrorCode=${result.errorCode}`);
+      }
+
+      setNavControlStatus("success");
+      setNavControlMessage(`恢复站立已下发，返回时间 ${result.timestamp || "-"}`);
+    } catch (error) {
+      setNavControlStatus("error");
+      setNavControlMessage(error instanceof Error ? error.message : "恢复站立下发失败");
     }
   };
 
@@ -1095,6 +1444,37 @@ export default function Home() {
           </div>
 
           <div className="flex flex-wrap gap-3">
+            <ControlButton
+              onClick={() => setTeleopEnabled((current) => !current)}
+              className={teleopEnabled ? "border-cyan-300/40 bg-cyan-400/10 text-cyan-100 hover:bg-cyan-400/20" : undefined}
+            >
+              <Hand className="h-4 w-4" />
+              {teleopEnabled ? "关闭键盘控狗" : "键盘控狗"}
+            </ControlButton>
+            <ControlButton
+              onClick={handleCancelNavigationTask}
+              disabled={navControlStatus === "submitting"}
+              className="border-amber-300/40 bg-amber-400/10 text-amber-100 hover:bg-amber-400/20"
+            >
+              <Hand className="h-4 w-4" />
+              取消导航
+            </ControlButton>
+            <ControlButton
+              onClick={handleSoftEstop}
+              disabled={navControlStatus === "submitting"}
+              className="border-rose-500/50 bg-rose-500/20 text-rose-100 hover:bg-rose-500/30"
+            >
+              <Hand className="h-4 w-4" />
+              紧急停止
+            </ControlButton>
+            <ControlButton
+              onClick={handleRecoverStand}
+              disabled={navControlStatus === "submitting"}
+              className="border-emerald-400/40 bg-emerald-400/10 text-emerald-100 hover:bg-emerald-400/20"
+            >
+              <Hand className="h-4 w-4" />
+              恢复站立
+            </ControlButton>
             <ControlButton onClick={resetView}>
               <RotateCcw className="h-4 w-4" />
               重置视角
@@ -2036,6 +2416,12 @@ export default function Home() {
 
             <div className="absolute right-4 top-4 w-[320px] rounded-2xl border border-white/10 bg-slate-950/75 px-4 py-3 text-sm text-slate-300 shadow-[0_12px_40px_rgba(0,0,0,0.3)] backdrop-blur">
               <div className="text-xs uppercase tracking-[0.35em] text-cyan-100">定位与导航状态</div>
+              <div className={`mt-3 rounded-2xl border px-3 py-2 text-xs ${teleopTone}`}>
+                {teleopMessage}
+              </div>
+              <div className={`mt-3 rounded-2xl border px-3 py-2 text-xs ${navControlTone}`}>
+                {navControlMessage}
+              </div>
               <div className="mt-3 rounded-2xl border border-white/10 bg-white/[0.03] p-3">
                 <div className="text-[11px] uppercase tracking-[0.25em] text-emerald-200">定位状态</div>
                 <div className="mt-2 flex items-center gap-2">

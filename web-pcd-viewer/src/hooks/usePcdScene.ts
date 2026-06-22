@@ -13,6 +13,7 @@ type UsePcdSceneOptions = {
   fileUrl: string;
   occGridAssetId: string | null;
   performanceProfile: PerformanceProfile;
+  keyboardCameraEnabled: boolean;
   pointSize: number;
   pointShape: "round" | "square";
   showGrid: boolean;
@@ -68,6 +69,7 @@ export function usePcdScene({
   fileUrl,
   occGridAssetId,
   performanceProfile,
+  keyboardCameraEnabled,
   pointSize,
   pointShape,
   showGrid,
@@ -118,6 +120,7 @@ export function usePcdScene({
   } | null>(null);
   const pointSizeRef = useRef(pointSize);
   const pointShapeRef = useRef(pointShape);
+  const keyboardCameraEnabledRef = useRef(keyboardCameraEnabled);
   const showGridRef = useRef(showGrid);
   const showAxesRef = useRef(showAxes);
   const showOccGridRef = useRef(showOccGrid);
@@ -142,6 +145,14 @@ export function usePcdScene({
     interactionUntilRef.current = Math.max(interactionUntilRef.current, now + interactionMs);
     renderRequestedRef.current = true;
   }, []);
+
+  useEffect(() => {
+    keyboardCameraEnabledRef.current = keyboardCameraEnabled;
+    if (!keyboardCameraEnabled) {
+      keysPressedRef.current.clear();
+    }
+    requestRender();
+  }, [keyboardCameraEnabled, requestRender]);
 
   useEffect(() => {
     pointSizeRef.current = pointSize;
@@ -666,6 +677,9 @@ export function usePcdScene({
     renderer.domElement.addEventListener("pointercancel", finishDraftTaskPoint);
 
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (!keyboardCameraEnabledRef.current) {
+        return;
+      }
       if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) {
         return;
       }
@@ -693,6 +707,9 @@ export function usePcdScene({
     };
 
     const handleKeyUp = (event: KeyboardEvent) => {
+      if (!keyboardCameraEnabledRef.current) {
+        return;
+      }
       keysPressedRef.current.delete(event.key);
       requestRender(800);
     };
@@ -892,7 +909,7 @@ export function usePcdScene({
 
     const animate = () => {
       const keys = keysPressedRef.current;
-      if (keys.size > 0) {
+      if (keyboardCameraEnabledRef.current && keys.size > 0) {
         moveCameraWithKeys(camera, controls, keys, Math.min(clock.getDelta(), 0.1));
         requestRender(1200);
       } else {
