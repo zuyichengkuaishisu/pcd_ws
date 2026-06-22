@@ -1,18 +1,21 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Aperture,
   Box,
   Crosshair,
+  Download,
   Grid2x2,
   Hand,
   ListOrdered,
   LocateFixed,
   MoonStar,
   RotateCcw,
+  Save,
   ScanSearch,
   Send,
   SunMedium,
   Trash2,
+  Upload,
 } from "lucide-react";
 
 import ControlButton from "@/components/ControlButton";
@@ -99,6 +102,37 @@ type PcdMapItem = {
 };
 
 const DEFAULT_PCD_URL = `/api/map/pcd/${encodeURIComponent("sample:outside_15cm_simpled.pcd")}`;
+
+type SavedRoute = {
+  id: string;
+  name: string;
+  points: TaskPoint[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+const ROUTES_STORAGE_KEY = "inspection_routes";
+
+function loadRoutesFromStorage(): SavedRoute[] {
+  try {
+    const raw = localStorage.getItem(ROUTES_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed;
+  } catch {
+    return [];
+  }
+}
+
+function saveRoutesToStorage(routes: SavedRoute[]) {
+  try {
+    localStorage.setItem(ROUTES_STORAGE_KEY, JSON.stringify(routes));
+  } catch {
+    // storage full or unavailable — silently ignore
+  }
+}
+
 type TeleopAxisPayload = {
   x: number;
   y: number;
@@ -230,6 +264,10 @@ export default function Home() {
   const [teleopEnabled, setTeleopEnabled] = useState(false);
   const [teleopStatus, setTeleopStatus] = useState<"idle" | "submitting" | "success" | "error">("idle");
   const [teleopMessage, setTeleopMessage] = useState("键盘控狗已关闭。开启后使用 W/X/A/D/Q/E 控制机器人移动与偏航。");
+  const [savedRoutes, setSavedRoutes] = useState<SavedRoute[]>(() => loadRoutesFromStorage());
+  const [selectedRouteId, setSelectedRouteId] = useState("");
+  const [routeNameInput, setRouteNameInput] = useState("");
+  const [routeMessage, setRouteMessage] = useState("可将当前任务点保存为路线，也可从本地 JSONL 恢复并切换路线。");
   const [showOccGrid, setShowOccGrid] = useState(false);
   const [mappingForm, setMappingForm] = useState({
     mapName: "",
@@ -265,6 +303,7 @@ export default function Home() {
   const teleopPressedKeysRef = useRef(new Set<string>());
   const teleopSendingRef = useRef(false);
   const teleopLastSignatureRef = useRef(serializeTeleopAxisPayload(ZERO_TELEOP_AXIS_PAYLOAD));
+  const routeImportInputRef = useRef<HTMLInputElement | null>(null);
   const performanceProfile = useMemo(() => resolvePerformanceProfile("auto"), []);
   const selectedPcdItem = useMemo(
     () => pcdItems.find((item) => item.id === selectedPcdId) ?? null,
@@ -285,6 +324,7 @@ export default function Home() {
 
     return { x, y, z, yaw };
   }, [initialPose]);
+  const selectedRoute = useMemo(() => savedRoutes.find((route) => route.id === selectedRouteId) ?? null, [savedRoutes, selectedRouteId]);
 
   const { containerRef, resetView, setTopView, setFrontView } = usePcdScene({
     fileUrl: selectedPcdUrl,
@@ -428,6 +468,10 @@ export default function Home() {
   useEffect(() => {
     void loadPcdList();
   }, [loadPcdList]);
+
+  useEffect(() => {
+    saveRoutesToStorage(savedRoutes);
+  }, [savedRoutes]);
 
   const statusTone =
     status === "error"
@@ -1332,6 +1376,150 @@ export default function Home() {
     setTaskDispatchMessage("已清空任务点。");
   };
 
+  const saveCurrentRoute = () => {
+    if (taskPoints.length === 0) {
+      setRouteMessage("当前没有任务点，无法保存路线。");
+      return;
+    }
+
+    const trimmedName = routeNameInput.trim();
+    if (!trimmedName) {
+      setRouteMessage("请先输入路线名称。");
+      return;
+    }
+
+    const normalizedPoints = reindexTaskPoints(taskPoints, robotPose?.yaw ?? 0, true);
+    const now = new Date().toISOString();
+
+    setSavedRoutes((current) => {
+      const existing = current.find((route) => route.id === selectedRouteId && route.name === trimmedName);
+      const nextRoute: SavedRoute = existing
+        ? {
+            ...existing,
+            name: trimmedName,
+            points: normalizedPoints,
+            updatedAt: now,
+          }
+        : {
+            id: crypto.randomUUID(),
+            name: trimmedName,
+            points: normalizedPoints,
+            createdAt: now,
+            updatedAt: now,
+          };
+
+      const nextRoutes = existing
+        ? current.map((route) => (route.id === existing.id ? nextRoute : route))
+        : [nextRoute, ...current];
+
+      setSelectedRouteId(nextRoute.id);
+      setRouteMessage(existing ? `已更新路线“${trimmedName}”。` : `已保存新路线“${trimmedName}”。`);
+      return nextRoutes;
+    });
+  };
+
+  const loadSelectedRoute = (routeId: string) => {
+    setSelectedRouteId(routeId);
+    const route = savedRoutes.find((item) => item.id === routeId);
+    if (!route) {
+      setRouteMessage("未找到所选路线。");
+      return;
+    }
+
+    setTaskPoints(reindexTaskPoints(route.points, robotPose?.yaw ?? 0, true));
+    setTaskEditorEnabled(false);
+    setTaskDispatchStatus("idle");
+    setTaskDispatchMessage(`已加载路线“${route.name}”，共 ${route.points.length} 个点位。`);
+    setRouteNameInput(route.name);
+    setRouteMessage(`已切换到路线“${route.name}”。`);
+  };
+
+  const deleteSelectedRoute = () => {
+    if (!selectedRoute) {
+      setRouteMessage("请先选择要删除的路线。");
+      return;
+    }
+
+    const routeName = selectedRoute.name;
+    setSavedRoutes((current) => current.filter((route) => route.id !== selectedRoute.id));
+    setSelectedRouteId("");
+    setRouteNameInput("");
+    setRouteMessage(`已删除路线“${routeName}”。`);
+  };
+
+  const importRouteFromJsonl = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+
+    try {
+      const raw = await file.text();
+      const lines = raw
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+
+      if (lines.length === 0) {
+        throw new Error("JSONL 文件为空。");
+      }
+
+      const parsedPoints = lines.map((line, index) => {
+        const item = JSON.parse(line) as Partial<TaskPoint> & {
+          type?: number;
+          gait?: number;
+          speed?: number;
+          manner?: number;
+          obs_mode?: number;
+          nav_mode?: number;
+          obsMode?: number;
+          navMode?: number;
+        };
+
+        const type = item.type === 0 || item.type === 1 || item.type === 3 ? item.type : 1;
+        return {
+          id: item.id ?? crypto.randomUUID(),
+          index: index + 1,
+          label: typeof item.label === "string" && item.label.trim() ? item.label : `P${index + 1}`,
+          type,
+          x: Number(item.x ?? 0),
+          y: Number(item.y ?? 0),
+          z: Number(item.z ?? 0),
+          yaw: Number(item.yaw ?? robotPose?.yaw ?? 0),
+          gait: Number(item.gait ?? DEFAULT_NAVIGATION_TASK.Gait),
+          speed: Number(item.speed ?? DEFAULT_NAVIGATION_TASK.Speed),
+          manner: Number(item.manner ?? DEFAULT_NAVIGATION_TASK.Manner),
+          obsMode: Number(item.obsMode ?? item.obs_mode ?? DEFAULT_NAVIGATION_TASK.ObsMode),
+          navMode: Number(item.navMode ?? item.nav_mode ?? DEFAULT_NAVIGATION_TASK.NavMode),
+          status: "draft" as const,
+        };
+      });
+
+      if (
+        parsedPoints.some((point) =>
+          [point.x, point.y, point.z, point.yaw, point.gait, point.speed, point.manner, point.obsMode, point.navMode].some(
+            (value) => Number.isNaN(value),
+          ),
+        )
+      ) {
+        throw new Error("JSONL 中存在无效数值字段。");
+      }
+
+      const normalized = reindexTaskPoints(parsedPoints, robotPose?.yaw ?? 0, true);
+      const inferredName = file.name.replace(/\.jsonl$/i, "").trim();
+      setTaskPoints(normalized);
+      setTaskEditorEnabled(false);
+      setTaskDispatchStatus("idle");
+      setTaskDispatchMessage(`已从 ${file.name} 导入 ${normalized.length} 个任务点。`);
+      setRouteNameInput(inferredName || "导入路线");
+      setRouteMessage(`已导入 JSONL：${file.name}。可直接保存为本地路线。`);
+    } catch (error) {
+      setRouteMessage(error instanceof Error ? error.message : "JSONL 导入失败。");
+    } finally {
+      event.target.value = "";
+    }
+  };
+
   const submitNavigationSequence = async () => {
     if (navigationPayloads.length === 0 || taskDispatchStatus === "dispatching") {
       return;
@@ -1423,6 +1611,43 @@ export default function Home() {
       );
       setTaskDispatchMessage(failedMessage);
     }
+  };
+
+  const exportRouteToJsonl = () => {
+    if (taskPoints.length === 0) {
+      return;
+    }
+
+    const lines = taskPoints.map((point) =>
+      JSON.stringify({
+        index: point.index,
+        label: point.label,
+        type: point.type,
+        type_name: TASK_POINT_TYPE_META[point.type].label,
+        x: Number(point.x.toFixed(3)),
+        y: Number(point.y.toFixed(3)),
+        z: Number(point.z.toFixed(3)),
+        yaw: Number(point.yaw.toFixed(6)),
+        gait: point.gait,
+        speed: point.speed,
+        manner: point.manner,
+        obs_mode: point.obsMode,
+        nav_mode: point.navMode,
+      }),
+    );
+
+    const blob = new Blob([lines.join("\n") + "\n"], { type: "application/x-ndjson" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const baseName = (routeNameInput.trim() || selectedRoute?.name || "inspection_route").replace(/[^\w\u4e00-\u9fa5-]+/g, "_");
+    anchor.download = `${baseName}_${timestamp}.jsonl`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    URL.revokeObjectURL(url);
+    setTaskDispatchMessage(`已导出 ${taskPoints.length} 个巡检点位为 JSONL 文件。`);
   };
 
   return (
@@ -2133,6 +2358,69 @@ export default function Home() {
                 </ControlButton>
               </div>
 
+              <div className="mt-4 rounded-2xl border border-white/10 bg-white/[0.03] p-3">
+                <div className="text-xs uppercase tracking-[0.25em] text-slate-500">路线管理</div>
+                <div className="mt-3 grid gap-3">
+                  <input
+                    className="w-full rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-300/40"
+                    value={routeNameInput}
+                    onChange={(event) => setRouteNameInput(event.target.value)}
+                    placeholder="输入路线名称，例如 1F_白班巡检"
+                  />
+                  <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto]">
+                    <select
+                      className="rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
+                      value={selectedRouteId}
+                      onChange={(event) => loadSelectedRoute(event.target.value)}
+                    >
+                      <option value="">选择已保存路线</option>
+                      {savedRoutes.map((route) => (
+                        <option key={route.id} value={route.id}>
+                          {route.name} ({route.points.length} 点)
+                        </option>
+                      ))}
+                    </select>
+                    <div className="flex flex-wrap gap-2">
+                      <ControlButton
+                        onClick={saveCurrentRoute}
+                        disabled={taskPoints.length === 0}
+                        className="border-cyan-300/40 bg-cyan-400/10 text-cyan-100 hover:bg-cyan-400/20"
+                      >
+                        <Save className="h-4 w-4" />
+                        保存路线
+                      </ControlButton>
+                      <ControlButton
+                        onClick={deleteSelectedRoute}
+                        disabled={!selectedRoute}
+                        className="border-rose-400/40 bg-rose-400/10 text-rose-100 hover:bg-rose-400/20"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                        删除路线
+                      </ControlButton>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <ControlButton
+                      onClick={() => routeImportInputRef.current?.click()}
+                      className="border-emerald-400/40 bg-emerald-400/10 text-emerald-100 hover:bg-emerald-400/20"
+                    >
+                      <Upload className="h-4 w-4" />
+                      导入 JSONL
+                    </ControlButton>
+                    <input
+                      ref={routeImportInputRef}
+                      type="file"
+                      accept=".jsonl,application/x-ndjson,application/json"
+                      className="hidden"
+                      onChange={importRouteFromJsonl}
+                    />
+                  </div>
+                </div>
+                <div className="mt-3 rounded-2xl border border-white/10 bg-slate-950/40 px-3 py-2 text-sm text-slate-300">
+                  {routeMessage}
+                </div>
+              </div>
+
               <div className="mt-4 text-xs uppercase tracking-[0.25em] text-slate-500">当前添加类型</div>
               <div className="mt-3 flex flex-wrap gap-2">
                 {TASK_POINT_TYPE_ORDER.map((type) => (
@@ -2171,6 +2459,14 @@ export default function Home() {
                 >
                   <Send className="h-4 w-4" />
                   {taskDispatchStatus === "dispatching" ? "下发中" : "真实顺序下发"}
+                </ControlButton>
+                <ControlButton
+                  onClick={() => exportRouteToJsonl()}
+                  disabled={taskPoints.length === 0}
+                  className="border-emerald-400/40 bg-emerald-400/10 text-emerald-100 hover:bg-emerald-400/20"
+                >
+                  <Download className="h-4 w-4" />
+                  导出 JSONL
                 </ControlButton>
               </div>
             </div>
