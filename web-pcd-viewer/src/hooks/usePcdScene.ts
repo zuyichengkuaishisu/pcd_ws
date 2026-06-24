@@ -291,9 +291,7 @@ export function usePcdScene({
   useEffect(() => {
     if (pointsRef.current) {
       const material = pointsRef.current.material as THREE.PointsMaterial;
-      material.size = pointSize;
-      applyPointShape(material, pointShapeRef.current);
-      material.needsUpdate = true;
+      applyPointMaterialStyle(material, pointSize, pointShapeRef.current);
     }
     requestRender();
   }, [pointShape, pointSize, requestRender]);
@@ -728,12 +726,10 @@ export function usePcdScene({
 
         const points = loadedPoints as THREE.Points;
         const material = points.material as THREE.PointsMaterial;
-        material.size = pointSizeRef.current;
-        material.sizeAttenuation = true;
+        applyPointMaterialStyle(material, pointSizeRef.current, pointShapeRef.current);
         material.color = new THREE.Color(darkBackgroundRef.current ? "#a5f3fc" : "#0369a1");
         material.transparent = true;
         material.opacity = 0.96;
-        applyPointShape(material, pointShapeRef.current);
 
         const position = points.geometry.getAttribute("position");
         const color = points.geometry.getAttribute("color");
@@ -1330,6 +1326,19 @@ function applyPointShape(material: THREE.PointsMaterial, pointShape: "round" | "
   texture.needsUpdate = true;
   material.map = texture;
   material.alphaTest = 0.45;
+  material.needsUpdate = true;
+}
+
+function applyPointMaterialStyle(material: THREE.PointsMaterial, pointSize: number, pointShape: "round" | "square") {
+  if (pointShape === "round") {
+    material.sizeAttenuation = false;
+    material.size = Math.max(pointSize * 90, 1.5);
+  } else {
+    material.sizeAttenuation = true;
+    material.size = pointSize;
+  }
+
+  applyPointShape(material, pointShape);
   material.needsUpdate = true;
 }
 
