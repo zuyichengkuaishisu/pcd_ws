@@ -1613,41 +1613,44 @@ export default function Home() {
     }
   };
 
-  const exportRouteToJsonl = () => {
+  const exportRouteToPathJson = () => {
     if (taskPoints.length === 0) {
       return;
     }
 
-    const lines = taskPoints.map((point) =>
-      JSON.stringify({
-        index: point.index,
-        label: point.label,
-        type: point.type,
-        type_name: TASK_POINT_TYPE_META[point.type].label,
-        x: Number(point.x.toFixed(3)),
-        y: Number(point.y.toFixed(3)),
-        z: Number(point.z.toFixed(3)),
-        yaw: Number(point.yaw.toFixed(6)),
-        gait: point.gait,
-        speed: point.speed,
-        manner: point.manner,
-        obs_mode: point.obsMode,
-        nav_mode: point.navMode,
-      }),
-    );
+    const taskId = crypto.randomUUID().replace(/-/g, "");
+    const payload = {
+      taskId,
+      sn: "CM20111188",
+      mapId: "map",
+      jobs: taskPoints.map((point, index) => {
+        const pose = {
+          x: Number(point.x.toFixed(3)),
+          y: Number(point.y.toFixed(3)),
+          yaw: Number(point.yaw.toFixed(6)),
+        };
 
-    const blob = new Blob([lines.join("\n") + "\n"], { type: "application/x-ndjson" });
+        return {
+          record_id: point.id.replace(/-/g, "") || `zyhz_${String(index + 1).padStart(3, "0")}`,
+          vel_line: 0.2,
+          start_pose: pose,
+          end_pose: pose,
+          action: {},
+        };
+      }),
+      cmd: 2001,
+    };
+
+    const blob = new Blob([`${JSON.stringify(payload, null, 2)}\n`], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const baseName = (routeNameInput.trim() || selectedRoute?.name || "inspection_route").replace(/[^\w\u4e00-\u9fa5-]+/g, "_");
-    anchor.download = `${baseName}_${timestamp}.jsonl`;
+    anchor.download = "path_ZYHZ.json";
     document.body.appendChild(anchor);
     anchor.click();
     document.body.removeChild(anchor);
     URL.revokeObjectURL(url);
-    setTaskDispatchMessage(`已导出 ${taskPoints.length} 个巡检点位为 JSONL 文件。`);
+    setTaskDispatchMessage(`已按 path_ZYHZ.json 格式导出 ${taskPoints.length} 个路径点。`);
   };
 
   return (
@@ -2461,12 +2464,12 @@ export default function Home() {
                   {taskDispatchStatus === "dispatching" ? "下发中" : "真实顺序下发"}
                 </ControlButton>
                 <ControlButton
-                  onClick={() => exportRouteToJsonl()}
+                  onClick={() => exportRouteToPathJson()}
                   disabled={taskPoints.length === 0}
                   className="border-emerald-400/40 bg-emerald-400/10 text-emerald-100 hover:bg-emerald-400/20"
                 >
                   <Download className="h-4 w-4" />
-                  导出 JSONL
+                  导出路径 JSON
                 </ControlButton>
               </div>
             </div>
