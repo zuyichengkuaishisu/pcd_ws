@@ -9,6 +9,7 @@ import {
   ListOrdered,
   LocateFixed,
   MoonStar,
+  Plus,
   RotateCcw,
   Save,
   ScanSearch,
@@ -31,6 +32,7 @@ import {
   NAVIGATION_OBS_MODE_OPTIONS,
   NAVIGATION_SPEED_OPTIONS,
   TASK_POINT_TYPE_META,
+  type TaskPointActionPreset,
   type NavigationTaskPayload,
   type TaskPoint,
   type TaskPointType,
@@ -48,9 +50,121 @@ const DEFAULT_NAVIGATION_TASK = {
   ObsMode: 0,
   NavMode: 1,
 } as const;
+const AUTO_UNDOCK_RECOVERABLE_ERROR_CODES = new Set([0xA343, 0xA344, 0xA345, 0xA34E]);
+const AUTO_UNDOCK_STATUS_TIMEOUT_MS = 30000;
+const AUTO_UNDOCK_STATUS_POLL_MS = 250;
 const TELEOP_LINEAR_RATIO = 0.35;
 const TELEOP_YAW_RATIO = 0.45;
 const TELEOP_SUPPORTED_KEYS = new Set(["w", "x", "a", "d", "q", "e"]);
+const EMPTY_ACTION_PRESET: TaskPointActionPreset = {
+  capture: [],
+  warning: null,
+};
+const PTZ_PAN_RANGE = { min: 0, max: 360 } as const;
+const PTZ_TILT_RANGE = { min: 0, max: 90 } as const;
+const PTZ_ZOOM_RANGE = { min: 0, max: 37 } as const;
+const AGENT_PTZ_SUCCESS_CODE = 10000;
+const AGENT_LIGHT_SUCCESS_CODE = 10000;
+const DEFAULT_WARNING_DURATION_SECONDS = 10;
+
+function waitForMs(ms: number) {
+  return new Promise<void>((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+// #region debug-point A:runtime-report-helper
+function reportAutoUndockDebugEvent(
+  hypothesisId: "A" | "B" | "C" | "D" | "E",
+  msg: string,
+  data: Record<string, unknown>,
+  traceId?: string,
+) {
+  fetch("http://127.0.0.1:7777/event", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      sessionId: "auto-undock-retry",
+      runId: "pre-fix",
+      hypothesisId,
+      location: "src/pages/Home.tsx",
+      msg: `[DEBUG] ${msg}`,
+      data,
+      traceId,
+      ts: Date.now(),
+    }),
+  }).catch(() => {});
+}
+// #endregion
+
+function formatChargeActionLabel(charge: 0 | 1 | 2) {
+  if (charge === 1) {
+    return "开始充电";
+  }
+  if (charge === 2) {
+    return "清除充电状态并退桩";
+  }
+  return "结束充电并退桩";
+}
+
+function formatChargeRuntimeLabel(charge: number | null) {
+  if (charge === 0) {
+    return "空闲";
+  }
+  if (charge === 1) {
+    return "前往充电桩";
+  }
+  if (charge === 2) {
+    return "充电中";
+  }
+  if (charge === 3) {
+    return "退出充电桩中";
+  }
+  if (charge === 4) {
+    return "机器人异常";
+  }
+  if (charge === 5) {
+    return "在桩上未充电";
+  }
+  return "未知";
+}
+
+function extractAgentBusinessCode(payload: unknown): number | null {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+
+  const record = payload as Record<string, unknown>;
+  const candidates = [record.code, record.errorCode, record.resultCode, record.errno];
+  for (const candidate of candidates) {
+    if (typeof candidate === "number" && Number.isFinite(candidate)) {
+      return candidate;
+    }
+    if (typeof candidate === "string" && candidate.trim() !== "" && !Number.isNaN(Number(candidate))) {
+      return Number(candidate);
+    }
+  }
+
+  return null;
+}
+
+function formatAgentBusinessError(payload: unknown, fallback: string) {
+  if (!payload || typeof payload !== "object") {
+    return fallback;
+  }
+
+  const record = payload as Record<string, unknown>;
+  const candidates = [record.msg, record.message, record.error, record.errmsg];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate;
+    }
+  }
+
+  return fallback;
+}
 
 type NavigationRuntimeState = {
   connection: "idle" | "loading" | "ready" | "error";
@@ -59,6 +173,33 @@ type NavigationRuntimeState = {
   errorCode: number | null;
   timestamp: string;
   message: string;
+};
+
+type ChargeRuntimeState = {
+  connection: "idle" | "loading" | "ready" | "error";
+  charge: number | null;
+  motionState: number | null;
+  timestamp: string;
+  localPort: number | null;
+  message: string;
+};
+
+type TaskSchedulerPhase =
+  | "idle"
+  | "dispatching_point"
+  | "waiting_start"
+  | "waiting_arrival"
+  | "executing_capture"
+  | "executing_warning";
+
+type TaskSchedulerState = {
+  active: boolean;
+  runId: string | null;
+  currentIndex: number;
+  phase: TaskSchedulerPhase;
+  navTimestampMarker: string;
+  homeChargeIndex: number | null;
+  homeChargePending: boolean;
 };
 
 type MappingMapSummary = {
@@ -259,6 +400,14 @@ export default function Home() {
   const [chargeActionStatus, setChargeActionStatus] = useState<"idle" | "submitting" | "success" | "error">("idle");
   const [chargeActionMessage, setChargeActionMessage] = useState("手动触发开始充电或结束充电。");
   const [robotChargeState, setRobotChargeState] = useState<"unknown" | "idle" | "charging">("unknown");
+  const [chargeRuntime, setChargeRuntime] = useState<ChargeRuntimeState>({
+    connection: "idle",
+    charge: null,
+    motionState: null,
+    timestamp: "",
+    localPort: null,
+    message: "等待机器人基础状态上报。",
+  });
   const [navControlStatus, setNavControlStatus] = useState<"idle" | "submitting" | "success" | "error">("idle");
   const [navControlMessage, setNavControlMessage] = useState("可在顶端快速取消导航任务，或立即下发软急停。");
   const [teleopEnabled, setTeleopEnabled] = useState(false);
@@ -300,10 +449,25 @@ export default function Home() {
     timestamp: "",
     message: "等待查询导航状态",
   });
+  const [taskSchedulerState, setTaskSchedulerState] = useState<TaskSchedulerState>({
+    active: false,
+    runId: null,
+    currentIndex: -1,
+    phase: "idle",
+    navTimestampMarker: "",
+    homeChargeIndex: null,
+    homeChargePending: false,
+  });
   const teleopPressedKeysRef = useRef(new Set<string>());
   const teleopSendingRef = useRef(false);
   const teleopLastSignatureRef = useRef(serializeTeleopAxisPayload(ZERO_TELEOP_AXIS_PAYLOAD));
   const routeImportInputRef = useRef<HTMLInputElement | null>(null);
+  const taskPointsRef = useRef(taskPoints);
+  const navigationPayloadsRef = useRef<NavigationTaskPayload[]>([]);
+  const chargeRuntimeRef = useRef(chargeRuntime);
+  const navigationRuntimeRef = useRef(navigationRuntime);
+  const robotChargeStateRef = useRef(robotChargeState);
+  const taskSchedulerStateRef = useRef(taskSchedulerState);
   const performanceProfile = useMemo(() => resolvePerformanceProfile("auto"), []);
   const selectedPcdItem = useMemo(
     () => pcdItems.find((item) => item.id === selectedPcdId) ?? null,
@@ -325,6 +489,38 @@ export default function Home() {
     return { x, y, z, yaw };
   }, [initialPose]);
   const selectedRoute = useMemo(() => savedRoutes.find((route) => route.id === selectedRouteId) ?? null, [savedRoutes, selectedRouteId]);
+
+  useEffect(() => {
+    taskPointsRef.current = taskPoints;
+  }, [taskPoints]);
+
+  useEffect(() => {
+    chargeRuntimeRef.current = chargeRuntime;
+  }, [chargeRuntime]);
+
+  useEffect(() => {
+    navigationRuntimeRef.current = navigationRuntime;
+  }, [navigationRuntime]);
+
+  useEffect(() => {
+    robotChargeStateRef.current = robotChargeState;
+  }, [robotChargeState]);
+
+  useEffect(() => {
+    if (chargeRuntime.charge === 2) {
+      setRobotChargeState("charging");
+      return;
+    }
+    if (chargeRuntime.charge === null) {
+      setRobotChargeState("unknown");
+      return;
+    }
+    setRobotChargeState("idle");
+  }, [chargeRuntime.charge]);
+
+  useEffect(() => {
+    taskSchedulerStateRef.current = taskSchedulerState;
+  }, [taskSchedulerState]);
 
   const { containerRef, resetView, setTopView, setFrontView } = usePcdScene({
     fileUrl: selectedPcdUrl,
@@ -365,6 +561,7 @@ export default function Home() {
               manner: DEFAULT_NAVIGATION_TASK.Manner,
               obsMode: DEFAULT_NAVIGATION_TASK.ObsMode,
               navMode: DEFAULT_NAVIGATION_TASK.NavMode,
+              actionPreset: cloneActionPreset(),
               status: "draft",
             },
           ],
@@ -516,6 +713,10 @@ export default function Home() {
     [taskPoints],
   );
 
+  useEffect(() => {
+    navigationPayloadsRef.current = navigationPayloads;
+  }, [navigationPayloads]);
+
   const taskDispatchTone =
     taskDispatchStatus === "dispatching"
       ? "border-cyan-300/40 bg-cyan-300/10 text-cyan-100"
@@ -534,6 +735,19 @@ export default function Home() {
     }
     return "border-amber-300/40 bg-amber-300/10 text-amber-100";
   }, [chargeActionStatus]);
+
+  const chargeRuntimeTone = useMemo(() => {
+    if (chargeRuntime.connection === "error") {
+      return "border-rose-400/40 bg-rose-400/10 text-rose-100";
+    }
+    if (chargeRuntime.connection === "ready") {
+      return "border-emerald-400/40 bg-emerald-400/10 text-emerald-100";
+    }
+    if (chargeRuntime.connection === "loading") {
+      return "border-cyan-300/40 bg-cyan-300/10 text-cyan-100";
+    }
+    return "border-white/10 bg-white/[0.03] text-slate-300";
+  }, [chargeRuntime.connection]);
 
   const navControlTone = useMemo(() => {
     if (navControlStatus === "error") {
@@ -588,6 +802,111 @@ export default function Home() {
     }
     return "border-amber-300/40 bg-amber-300/10 text-amber-100";
   }, [mappingActionStatus]);
+
+  const setTaskStatusesForIndex = useCallback((activeIndex: number, homeChargeIndex: number | null = null, homeChargePending = false) => {
+    setTaskPoints((current) =>
+      current.map((point, pointIndex) => ({
+        ...point,
+        status:
+          pointIndex === activeIndex
+            ? "running"
+            : homeChargePending && homeChargeIndex !== null && pointIndex === homeChargeIndex
+              ? "queued"
+              : pointIndex < activeIndex
+                ? "done"
+                : "queued",
+      })),
+    );
+  }, []);
+
+  const stopTaskScheduler = useCallback(
+    (nextStatus: "idle" | "prepared" | "error", message: string) => {
+      setTaskSchedulerState({
+        active: false,
+        runId: null,
+        currentIndex: -1,
+        phase: "idle",
+        navTimestampMarker: "",
+        homeChargeIndex: null,
+        homeChargePending: false,
+      });
+      setTaskDispatchStatus(nextStatus);
+      setTaskDispatchMessage(message);
+      if (nextStatus === "prepared") {
+        setTaskPoints((current) => current.map((point) => ({ ...point, status: "done" })));
+        return;
+      }
+
+      setTaskPoints((current) =>
+        current.map((point) => {
+          if (point.status === "done") {
+            return point;
+          }
+          if (nextStatus === "error" && point.status === "running") {
+            return { ...point, status: "error" };
+          }
+          return { ...point, status: "draft" };
+        }),
+      );
+    },
+    [],
+  );
+
+  const submitAgentPtzGoto = useCallback(async (payload: { pan_angle: number; tilt_angle: number; zoom: number; channel?: number }) => {
+    const response = await fetch("/api/agent/ptz/goto", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const result = (await response.json()) as {
+      ok: boolean;
+      error?: string;
+      data?: unknown;
+    };
+
+    if (!response.ok || !result.ok) {
+      throw new Error(result.error || `云台动作下发失败: HTTP ${response.status}`);
+    }
+
+    const businessCode = extractAgentBusinessCode(result.data);
+    if (businessCode !== AGENT_PTZ_SUCCESS_CODE) {
+      throw new Error(
+        formatAgentBusinessError(result.data, `云台动作返回业务码 ${businessCode ?? "未知"}，期望 ${AGENT_PTZ_SUCCESS_CODE}`),
+      );
+    }
+  }, []);
+
+  const submitAgentLightControl = useCallback(async (payload: { voice: boolean; light: boolean; times: number }) => {
+    const response = await fetch("/api/agent/light/control", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const result = (await response.json()) as {
+      ok: boolean;
+      error?: string;
+      data?: unknown;
+    };
+
+    if (!response.ok || !result.ok) {
+      throw new Error(result.error || `报警灯动作下发失败: HTTP ${response.status}`);
+    }
+
+    const businessCode = extractAgentBusinessCode(result.data);
+    if (businessCode !== AGENT_LIGHT_SUCCESS_CODE) {
+      throw new Error(
+        formatAgentBusinessError(result.data, `报警灯动作返回业务码 ${businessCode ?? "未知"}，期望 ${AGENT_LIGHT_SUCCESS_CODE}`),
+      );
+    }
+  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -741,6 +1060,78 @@ export default function Home() {
     };
   }, [performanceProfile.navigationPollingMs]);
 
+  useEffect(() => {
+    let disposed = false;
+    let timer: number | null = null;
+
+    const loadChargeRuntime = async () => {
+      setChargeRuntime((current) => ({
+        ...current,
+        connection: current.connection === "idle" ? "loading" : current.connection,
+      }));
+
+      try {
+        const response = await fetch("/api/robot/charge-runtime", {
+          method: "GET",
+          headers: {
+            Accept: "application/json",
+          },
+        });
+
+        const result = (await response.json()) as {
+          ok: boolean;
+          charge?: number;
+          motionState?: number;
+          timestamp?: string;
+          localPort?: number;
+          connection?: "idle" | "ready" | "error";
+          message?: string;
+          error?: string;
+        };
+
+        if (!response.ok || !result.ok) {
+          throw new Error(result.error || `充电状态查询失败: HTTP ${response.status}`);
+        }
+
+        if (disposed) {
+          return;
+        }
+
+        setChargeRuntime({
+          connection: result.connection ?? "idle",
+          charge: typeof result.charge === "number" ? result.charge : null,
+          motionState: typeof result.motionState === "number" ? result.motionState : null,
+          timestamp: result.timestamp ?? "",
+          localPort: typeof result.localPort === "number" ? result.localPort : null,
+          message: result.message ?? "等待机器人基础状态上报。",
+        });
+      } catch (error) {
+        if (disposed) {
+          return;
+        }
+
+        setChargeRuntime((current) => ({
+          ...current,
+          connection: "error",
+          message: error instanceof Error ? error.message : "充电状态查询失败",
+        }));
+      } finally {
+        if (!disposed) {
+          timer = window.setTimeout(loadChargeRuntime, performanceProfile.navigationPollingMs);
+        }
+      }
+    };
+
+    loadChargeRuntime();
+
+    return () => {
+      disposed = true;
+      if (timer !== null) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [performanceProfile.navigationPollingMs]);
+
   const fillFromCurrentPose = () => {
     if (!robotPose) {
       return;
@@ -801,9 +1192,13 @@ export default function Home() {
     }
   };
 
-  const submitRobotChargeAction = async (charge: 0 | 1, pendingMessage?: string) => {
+  const submitRobotChargeAction = async (charge: 0 | 1 | 2, pendingMessage?: string) => {
     setChargeActionStatus("submitting");
-    setChargeActionMessage(pendingMessage ?? (charge === 1 ? "正在下发开始充电指令。" : "正在下发结束充电指令。"));
+    const actionLabel = formatChargeActionLabel(charge);
+    setChargeActionMessage(pendingMessage ?? `正在下发${actionLabel}指令。`);
+    // #region debug-point B:charge-request
+    reportAutoUndockDebugEvent("B", "submitRobotChargeAction called", { charge, actionLabel, pendingMessage }, `${charge}-${Date.now()}`);
+    // #endregion
 
     const response = await fetch("/api/robot/charge", {
       method: "POST",
@@ -827,14 +1222,107 @@ export default function Home() {
     }
 
     if ((result.errorCode ?? 0) !== 0) {
-      throw new Error(`${charge === 1 ? "开始充电" : "结束充电"}返回 ErrorCode=${result.errorCode}`);
+      // #region debug-point B:charge-response-error
+      reportAutoUndockDebugEvent("B", "submitRobotChargeAction returned non-zero error", { charge, actionLabel, result });
+      // #endregion
+      throw new Error(`${actionLabel}返回 ErrorCode=${result.errorCode}`);
     }
 
     setChargeActionStatus("success");
-    setChargeActionMessage(`${charge === 1 ? "开始充电" : "结束充电"}指令已下发，返回时间 ${result.timestamp || "-"}。`);
+    setChargeActionMessage(`${actionLabel}指令已下发，返回时间 ${result.timestamp || "-"}。`);
     setRobotChargeState(charge === 1 ? "charging" : "idle");
+    // #region debug-point B:charge-response-ok
+    reportAutoUndockDebugEvent("B", "submitRobotChargeAction succeeded", { charge, actionLabel, result });
+    // #endregion
     return result;
   };
+
+  const waitForChargeRuntimeReady = useCallback(async (runId: string, pointLabel: string) => {
+    const startedAt = Date.now();
+
+    while (Date.now() - startedAt < AUTO_UNDOCK_STATUS_TIMEOUT_MS) {
+      if (taskSchedulerStateRef.current.runId !== runId) {
+        return false;
+      }
+
+      const runtime = chargeRuntimeRef.current;
+      if (runtime.connection === "ready" && runtime.charge !== null) {
+        return true;
+      }
+
+      setTaskDispatchMessage(`${pointLabel} 正在等待机器人上报充电状态。`);
+      await waitForMs(AUTO_UNDOCK_STATUS_POLL_MS);
+    }
+
+    throw new Error(`${pointLabel} 未收到机器人充电状态上报，无法执行退桩闭环。`);
+  }, []);
+
+  const waitForUndockCompletion = useCallback(async (runId: string, pointLabel: string) => {
+    const startedAt = Date.now();
+    let observedUndocking = chargeRuntimeRef.current.charge === 3;
+
+    while (Date.now() - startedAt < AUTO_UNDOCK_STATUS_TIMEOUT_MS) {
+      if (taskSchedulerStateRef.current.runId !== runId) {
+        return false;
+      }
+
+      const runtime = chargeRuntimeRef.current;
+      if (runtime.connection === "ready") {
+        if (runtime.charge === 3) {
+          observedUndocking = true;
+          setTaskDispatchMessage(`${pointLabel} 正在退桩，等待机器人回到空闲状态。`);
+        } else if (observedUndocking && runtime.charge === 0) {
+          setTaskDispatchMessage(`${pointLabel} 已完成退桩，准备重新下发导航。`);
+          return true;
+        } else {
+          setTaskDispatchMessage(`${pointLabel} 当前充电状态：${formatChargeRuntimeLabel(runtime.charge)}，等待退桩完成。`);
+        }
+      }
+
+      await waitForMs(AUTO_UNDOCK_STATUS_POLL_MS);
+    }
+
+    throw new Error(
+      `${pointLabel} 退桩超时，当前充电状态 ${formatChargeRuntimeLabel(chargeRuntimeRef.current.charge)}，未等到“退出充电桩中 -> 空闲”。`,
+    );
+  }, []);
+
+  const ensureRobotUndockedBeforeNavigation = useCallback(async (runId: string, pointLabel: string, traceId: string) => {
+    await waitForChargeRuntimeReady(runId, pointLabel);
+    if (taskSchedulerStateRef.current.runId !== runId) {
+      return false;
+    }
+
+    const runtime = chargeRuntimeRef.current;
+    const needsUndock = runtime.charge === 2 || runtime.charge === 3 || runtime.charge === 5;
+    if (!needsUndock) {
+      return false;
+    }
+
+    // #region debug-point D:charge-runtime-closed-loop
+    reportAutoUndockDebugEvent(
+      "D",
+      "charge runtime indicates docked state, entering closed-loop undock",
+      {
+        pointLabel,
+        charge: runtime.charge,
+        motionState: runtime.motionState,
+        timestamp: runtime.timestamp,
+      },
+      traceId,
+    );
+    // #endregion
+
+    if (runtime.charge !== 3) {
+      await submitRobotChargeAction(0, `${pointLabel} 检测到机器人仍在桩上，正在自动退桩。`);
+      if (taskSchedulerStateRef.current.runId !== runId) {
+        return false;
+      }
+    }
+
+    await waitForUndockCompletion(runId, pointLabel);
+    return true;
+  }, [waitForChargeRuntimeReady, waitForUndockCompletion]);
 
   const handleRobotChargeAction = async (charge: 0 | 1) => {
     try {
@@ -844,6 +1332,350 @@ export default function Home() {
       setChargeActionMessage(error instanceof Error ? error.message : "自主充电指令下发失败");
     }
   };
+
+  const dispatchTaskPoint = useCallback(
+    async (index: number, runId: string, homeChargeIndex?: number | null, homeChargePending?: boolean) => {
+      try {
+        // #region debug-point A:dispatch-entry
+        reportAutoUndockDebugEvent("A", "dispatchTaskPoint entered", {
+          index,
+          runId,
+          currentRunId: taskSchedulerStateRef.current.runId,
+          currentIndex: taskSchedulerStateRef.current.currentIndex,
+          currentPhase: taskSchedulerStateRef.current.phase,
+        }, `${runId}:${index}:entry`);
+        // #endregion
+        if (taskSchedulerStateRef.current.runId !== runId) {
+          // #region debug-point A:dispatch-early-return
+          reportAutoUndockDebugEvent("A", "dispatchTaskPoint returned early because runId mismatched", {
+            index,
+            runId,
+            currentRunId: taskSchedulerStateRef.current.runId,
+            currentIndex: taskSchedulerStateRef.current.currentIndex,
+            currentPhase: taskSchedulerStateRef.current.phase,
+          }, `${runId}:${index}:mismatch`);
+          // #endregion
+          return;
+        }
+
+        const effectiveHomeChargeIndex = homeChargeIndex ?? taskSchedulerStateRef.current.homeChargeIndex;
+        const effectiveHomeChargePending = homeChargePending ?? taskSchedulerStateRef.current.homeChargePending;
+
+        const payload = navigationPayloadsRef.current[index];
+        const point = taskPointsRef.current[index];
+        if (!payload || !point) {
+          stopTaskScheduler("error", `第 ${index + 1} 个点位不存在，无法继续执行。`);
+          return;
+        }
+
+        const pointLabel = point.label || `P${index + 1}`;
+        const traceId = `${runId}:${index}:${Date.now()}`;
+        const isHomeChargeStartPoint =
+          point.type === 3 && effectiveHomeChargePending && effectiveHomeChargeIndex !== null && index === effectiveHomeChargeIndex;
+        const navigationPointInfo = isHomeChargeStartPoint ? 1 : payload.PointInfo;
+        const submitPayload = navigationPointInfo === payload.PointInfo ? payload : { ...payload, PointInfo: navigationPointInfo };
+
+        setTaskSchedulerState({
+          active: true,
+          runId,
+          currentIndex: index,
+          phase: "dispatching_point",
+          navTimestampMarker: navigationRuntimeRef.current.timestamp,
+          homeChargeIndex: effectiveHomeChargeIndex,
+          homeChargePending: effectiveHomeChargePending,
+        });
+        setTaskStatusesForIndex(index, effectiveHomeChargeIndex, effectiveHomeChargePending);
+        setTaskDispatchMessage(`正在下发 ${pointLabel}，等待机器人接受并开始导航。`);
+        // #region debug-point A:dispatch-start
+        reportAutoUndockDebugEvent("A", "dispatchTaskPoint start", {
+          index,
+          pointLabel,
+          payload: submitPayload,
+          originalPointInfo: payload.PointInfo,
+          submitPointInfo: navigationPointInfo,
+          robotChargeState: robotChargeStateRef.current,
+          effectiveHomeChargeIndex,
+          effectiveHomeChargePending,
+        }, traceId);
+        // #endregion
+
+        const submitNavigationTask = async () => {
+          const response = await fetch("/api/robot/navigation-task", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "application/json",
+            },
+            body: JSON.stringify(submitPayload),
+          });
+
+          const result = (await response.json()) as {
+            ok: boolean;
+            error?: string;
+            errorCode?: number;
+            status?: number;
+            timestamp?: string;
+          };
+
+          if (!response.ok || !result.ok) {
+            // #region debug-point E:navigation-http-error
+            reportAutoUndockDebugEvent("E", "navigation request failed at HTTP/API level", { index, pointLabel, result, status: response.status }, traceId);
+            // #endregion
+            throw new Error(result.error || `${pointLabel} 下发失败: HTTP ${response.status}`);
+          }
+
+          // #region debug-point A:navigation-result
+          reportAutoUndockDebugEvent("A", "navigation request completed", { index, pointLabel, result }, traceId);
+          // #endregion
+          return result;
+        };
+
+        if (isHomeChargeStartPoint) {
+          // #region debug-point D:home-charge-pre-undock
+          reportAutoUndockDebugEvent("D", "home charge start point detected, checking dock state before navigation", {
+            index,
+            pointLabel,
+            effectiveHomeChargeIndex,
+            effectiveHomeChargePending,
+            pointType: point.type,
+          }, traceId);
+          // #endregion
+          await ensureRobotUndockedBeforeNavigation(runId, pointLabel, traceId);
+          if (taskSchedulerStateRef.current.runId !== runId) {
+            return;
+          }
+        }
+
+        let result = await submitNavigationTask();
+
+        if (AUTO_UNDOCK_RECOVERABLE_ERROR_CODES.has(result.errorCode ?? -1)) {
+          // #region debug-point C:auto-undock-branch
+          reportAutoUndockDebugEvent("C", "auto undock branch entered after navigation result", { index, pointLabel, result }, traceId);
+          // #endregion
+          await ensureRobotUndockedBeforeNavigation(runId, pointLabel, traceId);
+          if (taskSchedulerStateRef.current.runId !== runId) {
+            return;
+          }
+          result = await submitNavigationTask();
+          // #region debug-point C:retry-navigation-result
+          reportAutoUndockDebugEvent("C", "navigation retried after auto undock", { index, pointLabel, result }, traceId);
+          // #endregion
+        }
+
+        if (!NAVIGATION_SUCCESS_ERROR_CODES.has(result.errorCode ?? 0)) {
+          // #region debug-point E:navigation-non-success
+          reportAutoUndockDebugEvent("E", "navigation ended with non-success code", { index, pointLabel, result }, traceId);
+          // #endregion
+          throw new Error(`${pointLabel} 返回 ErrorCode=${result.errorCode}`);
+        }
+
+        if (taskSchedulerStateRef.current.runId !== runId) {
+          return;
+        }
+
+        setTaskSchedulerState({
+          active: true,
+          runId,
+          currentIndex: index,
+          phase: "waiting_start",
+          navTimestampMarker: navigationRuntimeRef.current.timestamp,
+          homeChargeIndex: effectiveHomeChargeIndex,
+          homeChargePending: effectiveHomeChargePending,
+        });
+        setTaskDispatchMessage(`已下发 ${pointLabel}，等待机器人开始导航并到达目标点。`);
+        // #region debug-point D:navigation-success-path
+        reportAutoUndockDebugEvent("D", "dispatchTaskPoint entered waiting_start", { index, pointLabel, result }, traceId);
+        // #endregion
+      } catch (error) {
+        // #region debug-point E:dispatch-catch
+        reportAutoUndockDebugEvent("E", "dispatchTaskPoint catch reached", {
+          index,
+          runId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        // #endregion
+        stopTaskScheduler("error", error instanceof Error ? error.message : `第 ${index + 1} 个点位下发失败。`);
+      }
+    },
+    [setTaskStatusesForIndex, stopTaskScheduler],
+  );
+
+  const executeTaskPointActions = useCallback(
+    async (index: number, runId: string) => {
+      try {
+        const point = taskPointsRef.current[index];
+        if (!point) {
+          stopTaskScheduler("error", `第 ${index + 1} 个点位不存在，无法执行动作。`);
+          return;
+        }
+
+        const pointLabel = point.label || `P${index + 1}`;
+        const actions = normalizeActionPreset(point.actionPreset);
+
+        if (actions.capture.length > 0) {
+          setTaskSchedulerState((current) => ({
+            ...current,
+            active: true,
+            runId,
+            currentIndex: index,
+            phase: "executing_capture",
+          }));
+          for (let captureIndex = 0; captureIndex < actions.capture.length; captureIndex += 1) {
+            const item = actions.capture[captureIndex];
+            setTaskDispatchMessage(
+              `${pointLabel} 已到点，正在执行云台动作 ${captureIndex + 1}/${actions.capture.length}：Pan=${item.panAngle} Tilt=${item.tiltAngle} Zoom=${item.zoom}。`,
+            );
+            await submitAgentPtzGoto({
+              channel: 1,
+              pan_angle: item.panAngle,
+              tilt_angle: item.tiltAngle,
+              zoom: item.zoom,
+            });
+            if (taskSchedulerStateRef.current.runId !== runId) {
+              return;
+            }
+          }
+        }
+
+        if (actions.warning) {
+          setTaskSchedulerState((current) => ({
+            ...current,
+            active: true,
+            runId,
+            currentIndex: index,
+            phase: "executing_warning",
+          }));
+          setTaskDispatchMessage(
+            `${pointLabel} 已到点，正在执行报警灯动作：voice=${actions.warning.voice ? "on" : "off"}，light=${actions.warning.light ? "on" : "off"}，duration=${actions.warning.times}s。`,
+          );
+          await submitAgentLightControl({
+            voice: actions.warning.voice,
+            light: actions.warning.light,
+            times: actions.warning.times,
+          });
+          if (taskSchedulerStateRef.current.runId !== runId) {
+            return;
+          }
+        }
+
+        const homeChargeIndex = taskSchedulerStateRef.current.homeChargeIndex;
+        const homeChargePending = taskSchedulerStateRef.current.homeChargePending;
+        const isHomeChargePoint = homeChargeIndex !== null && index === homeChargeIndex;
+
+        if (point.type === 3) {
+          if (isHomeChargePoint && homeChargePending) {
+            setTaskDispatchMessage(`${pointLabel} 为环形路线起点充电点，已到点，继续前往下一个导航点。`);
+          } else {
+            setTaskDispatchMessage(`${pointLabel} 为充电点，已到点，正在自动开始充电。`);
+            await submitRobotChargeAction(1, `${pointLabel} 为充电点，已到点，正在自动开始充电。`);
+            if (taskSchedulerStateRef.current.runId !== runId) {
+              return;
+            }
+          }
+        }
+
+        setTaskPoints((current) =>
+          current.map((item, itemIndex) => ({
+            ...item,
+            status:
+              homeChargePending &&
+              homeChargeIndex !== null &&
+              itemIndex === homeChargeIndex &&
+              index !== homeChargeIndex
+                ? "queued"
+                : itemIndex <= index
+                  ? "done"
+                  : "queued",
+          })),
+        );
+
+        const nextIndex = index + 1;
+        if (homeChargePending && homeChargeIndex !== null && nextIndex < navigationPayloadsRef.current.length) {
+          setTaskDispatchMessage(`${pointLabel} 动作执行完成，准备前往下一个点。`);
+          await dispatchTaskPoint(nextIndex, runId, homeChargeIndex, true);
+          return;
+        }
+
+        if (homeChargePending && homeChargeIndex !== null && index !== homeChargeIndex) {
+          setTaskDispatchMessage(`${pointLabel} 动作执行完成，正在返回首个充电点并自动充电。`);
+          await dispatchTaskPoint(homeChargeIndex, runId, homeChargeIndex, false);
+          return;
+        }
+
+        if (nextIndex >= navigationPayloadsRef.current.length || (homeChargeIndex !== null && index === homeChargeIndex)) {
+          stopTaskScheduler("prepared", `已按逐点调度方式完成 ${navigationPayloadsRef.current.length} 个点位：逐点到达、执行任务、再继续导航。`);
+          return;
+        }
+
+        setTaskDispatchMessage(`${pointLabel} 动作执行完成，准备前往下一个点。`);
+        await dispatchTaskPoint(nextIndex, runId, homeChargeIndex, false);
+      } catch (error) {
+        stopTaskScheduler("error", error instanceof Error ? error.message : `第 ${index + 1} 个点位动作执行失败。`);
+      }
+    },
+    [dispatchTaskPoint, stopTaskScheduler, submitAgentLightControl, submitAgentPtzGoto],
+  );
+
+  useEffect(() => {
+    if (!taskSchedulerState.active || !taskSchedulerState.runId || taskSchedulerState.currentIndex < 0) {
+      return;
+    }
+
+    if (taskSchedulerState.phase !== "waiting_start" && taskSchedulerState.phase !== "waiting_arrival") {
+      return;
+    }
+
+    if (navigationRuntime.connection !== "ready") {
+      return;
+    }
+
+    if (navigationRuntime.timestamp === taskSchedulerState.navTimestampMarker) {
+      return;
+    }
+
+    const activeIndex = taskSchedulerState.currentIndex;
+    const activePoint = taskPointsRef.current[activeIndex];
+    if (!activePoint) {
+      stopTaskScheduler("error", `当前执行点 ${activeIndex + 1} 丢失，逐点调度已停止。`);
+      return;
+    }
+
+    const pointLabel = activePoint.label || `P${activeIndex + 1}`;
+    const matchesCurrentPoint = navigationRuntime.value === null || navigationRuntime.value === activeIndex;
+    if (!matchesCurrentPoint) {
+      return;
+    }
+
+    if (navigationRuntime.errorCode !== null && navigationRuntime.errorCode !== 0 && navigationRuntime.errorCode !== 0x2300) {
+      stopTaskScheduler(
+        "error",
+        `${pointLabel} 导航失败：${formatNavigationRuntimeMessage(navigationRuntime.status, navigationRuntime.errorCode)}（${formatNavigationErrorCode(
+          navigationRuntime.errorCode,
+        )}）。`,
+      );
+      return;
+    }
+
+    if (navigationRuntime.status === 3 && taskSchedulerState.phase === "waiting_start") {
+      setTaskSchedulerState((current) => ({
+        ...current,
+        phase: "waiting_arrival",
+        navTimestampMarker: navigationRuntime.timestamp,
+      }));
+      setTaskDispatchMessage(`${pointLabel} 已开始导航，等待机器人到达目标点。`);
+      return;
+    }
+
+    if (navigationRuntime.status === 4 || navigationRuntime.errorCode === 0x2300) {
+      setTaskSchedulerState((current) => ({
+        ...current,
+        phase: "executing_capture",
+        navTimestampMarker: navigationRuntime.timestamp,
+      }));
+      setTaskDispatchMessage(`${pointLabel} 已到点，开始执行该点任务。`);
+      void executeTaskPointActions(activeIndex, taskSchedulerState.runId);
+    }
+  }, [executeTaskPointActions, navigationRuntime, stopTaskScheduler, taskSchedulerState]);
 
   const submitTeleopAxisControl = useCallback(async (payload: TeleopAxisPayload) => {
     if (teleopSendingRef.current) {
@@ -1004,6 +1836,7 @@ export default function Home() {
 
       setNavControlStatus("success");
       setNavControlMessage(`已下发取消导航任务，返回时间 ${result.timestamp || "-"}`);
+      stopTaskScheduler("idle", "已取消当前逐点调度，未完成点位已恢复为草稿状态。");
     } catch (error) {
       setNavControlStatus("error");
       setNavControlMessage(error instanceof Error ? error.message : "取消导航任务失败");
@@ -1041,6 +1874,7 @@ export default function Home() {
 
       setNavControlStatus("success");
       setNavControlMessage(`软急停已下发，返回时间 ${result.timestamp || "-"}`);
+      stopTaskScheduler("error", "软急停已触发，逐点调度已中断。");
     } catch (error) {
       setNavControlStatus("error");
       setNavControlMessage(error instanceof Error ? error.message : "软急停下发失败");
@@ -1189,6 +2023,7 @@ export default function Home() {
     setInitialPose(null);
     setInitialPoseStatus("idle");
     setInitialPoseMessage("点击“开始标注”后，在画布上按下并拖动即可设置 2D Pose Estimate；PosZ 默认按 0 下发。");
+    stopTaskScheduler("idle", "地图已切换，原逐点调度已停止。");
     setTaskPoints([]);
     setTaskDispatchStatus("idle");
     setTaskDispatchMessage("地图已切换。点击“编辑任务点”后，长按并拖动鼠标即可添加点位并标定方向。");
@@ -1358,6 +2193,107 @@ export default function Home() {
     setTaskDispatchMessage("已更新点位导航参数，顺序任务预览已刷新。");
   };
 
+  const updateTaskPointActionPreset = useCallback(
+    (id: string, updater: (actionPreset: TaskPointActionPreset) => TaskPointActionPreset, message: string) => {
+      setTaskPoints((current) =>
+        reindexTaskPoints(
+          current.map((point) =>
+            point.id === id
+              ? {
+                  ...point,
+                  actionPreset: normalizeActionPreset(updater(normalizeActionPreset(point.actionPreset))),
+                }
+              : point,
+          ),
+          robotPose?.yaw ?? 0,
+          true,
+        ),
+      );
+      setTaskDispatchStatus("idle");
+      setTaskDispatchMessage(message);
+    },
+    [robotPose?.yaw],
+  );
+
+  const addTaskPointCapture = useCallback((id: string) => {
+    updateTaskPointActionPreset(
+      id,
+      (actionPreset) => ({
+        ...actionPreset,
+        capture: [...actionPreset.capture, { panAngle: 0, tiltAngle: 0, zoom: 1 }],
+      }),
+      "已新增一组云台动作。",
+    );
+  }, [updateTaskPointActionPreset]);
+
+  const removeTaskPointCapture = useCallback((id: string, captureIndex: number) => {
+    updateTaskPointActionPreset(
+      id,
+      (actionPreset) => ({
+        ...actionPreset,
+        capture: actionPreset.capture.filter((_, index) => index !== captureIndex),
+      }),
+      "已删除一组云台动作。",
+    );
+  }, [updateTaskPointActionPreset]);
+
+  const updateTaskPointCaptureField = useCallback(
+    (id: string, captureIndex: number, field: "panAngle" | "tiltAngle" | "zoom", value: number) => {
+      updateTaskPointActionPreset(
+        id,
+        (actionPreset) => ({
+          ...actionPreset,
+          capture: actionPreset.capture.map((item, index) =>
+            index === captureIndex
+              ? {
+                  ...item,
+                  [field]:
+                    field === "panAngle"
+                      ? clampCapturePanAngle(value)
+                      : field === "tiltAngle"
+                        ? clampCaptureTiltAngle(value)
+                        : clampCaptureZoom(value),
+                }
+              : item,
+          ),
+        }),
+        "已更新云台动作参数。",
+      );
+    },
+    [updateTaskPointActionPreset],
+  );
+
+  const setTaskPointWarningEnabled = useCallback((id: string, enabled: boolean) => {
+    updateTaskPointActionPreset(
+      id,
+      (actionPreset) => ({
+        ...actionPreset,
+        warning: enabled
+          ? actionPreset.warning ?? { voice: true, light: true, times: DEFAULT_WARNING_DURATION_SECONDS }
+          : null,
+      }),
+      enabled ? "已启用报警灯控制。" : "已关闭报警灯控制。",
+    );
+  }, [updateTaskPointActionPreset]);
+
+  const updateTaskPointWarningField = useCallback(
+    (id: string, field: "voice" | "light" | "times", value: boolean | number) => {
+      updateTaskPointActionPreset(
+        id,
+        (actionPreset) => ({
+          ...actionPreset,
+          warning: {
+            voice: field === "voice" ? Boolean(value) : Boolean(actionPreset.warning?.voice),
+            light: field === "light" ? Boolean(value) : Boolean(actionPreset.warning?.light),
+            times: field === "times" ? clampWarningTimes(Number(value)) : clampWarningTimes(Number(actionPreset.warning?.times ?? 1)),
+          },
+        }),
+        "已更新报警灯控制参数。",
+      );
+    },
+    [updateTaskPointActionPreset],
+  );
+
   const removeTaskPoint = (id: string) => {
     setTaskPoints((current) => reindexTaskPoints(current.filter((point) => point.id !== id), robotPose?.yaw ?? 0, true));
     setTaskDispatchStatus("idle");
@@ -1455,45 +2391,7 @@ export default function Home() {
 
     try {
       const raw = await file.text();
-      const lines = raw
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean);
-
-      if (lines.length === 0) {
-        throw new Error("JSONL 文件为空。");
-      }
-
-      const parsedPoints = lines.map((line, index) => {
-        const item = JSON.parse(line) as Partial<TaskPoint> & {
-          type?: number;
-          gait?: number;
-          speed?: number;
-          manner?: number;
-          obs_mode?: number;
-          nav_mode?: number;
-          obsMode?: number;
-          navMode?: number;
-        };
-
-        const type = item.type === 0 || item.type === 1 || item.type === 3 ? item.type : 1;
-        return {
-          id: item.id ?? crypto.randomUUID(),
-          index: index + 1,
-          label: typeof item.label === "string" && item.label.trim() ? item.label : `P${index + 1}`,
-          type,
-          x: Number(item.x ?? 0),
-          y: Number(item.y ?? 0),
-          z: Number(item.z ?? 0),
-          yaw: Number(item.yaw ?? robotPose?.yaw ?? 0),
-          gait: Number(item.gait ?? DEFAULT_NAVIGATION_TASK.Gait),
-          speed: Number(item.speed ?? DEFAULT_NAVIGATION_TASK.Speed),
-          manner: Number(item.manner ?? DEFAULT_NAVIGATION_TASK.Manner),
-          obsMode: Number(item.obsMode ?? item.obs_mode ?? DEFAULT_NAVIGATION_TASK.ObsMode),
-          navMode: Number(item.navMode ?? item.nav_mode ?? DEFAULT_NAVIGATION_TASK.NavMode),
-          status: "draft" as const,
-        };
-      });
+      const parsedPoints = parseImportedRouteFile(raw, file.name, robotPose?.yaw ?? 0);
 
       if (
         parsedPoints.some((point) =>
@@ -1502,19 +2400,20 @@ export default function Home() {
           ),
         )
       ) {
-        throw new Error("JSONL 中存在无效数值字段。");
+        throw new Error("导入文件中存在无效数值字段。");
       }
 
       const normalized = reindexTaskPoints(parsedPoints, robotPose?.yaw ?? 0, true);
-      const inferredName = file.name.replace(/\.jsonl$/i, "").trim();
+      const inferredName = file.name.replace(/\.(jsonl|json)$/i, "").trim();
+      stopTaskScheduler("idle", `已导入 ${file.name}，原逐点调度已停止。`);
       setTaskPoints(normalized);
       setTaskEditorEnabled(false);
       setTaskDispatchStatus("idle");
       setTaskDispatchMessage(`已从 ${file.name} 导入 ${normalized.length} 个任务点。`);
       setRouteNameInput(inferredName || "导入路线");
-      setRouteMessage(`已导入 JSONL：${file.name}。可直接保存为本地路线。`);
+      setRouteMessage(`已导入路线文件：${file.name}。可直接保存为本地路线。`);
     } catch (error) {
-      setRouteMessage(error instanceof Error ? error.message : "JSONL 导入失败。");
+      setRouteMessage(error instanceof Error ? error.message : "路线导入失败。");
     } finally {
       event.target.value = "";
     }
@@ -1526,90 +2425,28 @@ export default function Home() {
     }
 
     setTaskDispatchStatus("dispatching");
-    setTaskDispatchMessage("正在按顺序真实下发 1003/1 单点导航任务，请勿重复点击。");
+    setTaskDispatchMessage("正在启动逐点调度：每次只下发一个点，到点执行任务后再继续前往下一个点。");
     setTaskEditorEnabled(false);
     setTaskPoints((current) => current.map((point) => ({ ...point, status: "queued" })));
 
     try {
-      let isCharging = robotChargeState === "charging";
-
-      for (let index = 0; index < navigationPayloads.length; index += 1) {
-        const payload = navigationPayloads[index];
-        const pointLabel = taskPoints[index]?.label ?? `P${index + 1}`;
-
-        if (isCharging) {
-          setTaskDispatchMessage(`检测到当前为充电状态，正在结束充电后下发 ${pointLabel}。`);
-          await submitRobotChargeAction(0, `检测到当前为充电状态，正在结束充电后下发 ${pointLabel}。`);
-          isCharging = false;
-        }
-
-        setTaskPoints((current) =>
-          current.map((point, pointIndex) => ({
-            ...point,
-            status: pointIndex < index ? "done" : pointIndex === index ? "running" : "queued",
-          })),
-        );
-        setTaskDispatchMessage(`正在下发 ${pointLabel}，类型为 ${TASK_POINT_TYPE_META[payload.PointInfo].label}。`);
-
-        const response = await fetch("/api/robot/navigation-task", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Accept: "application/json",
-          },
-          body: JSON.stringify(payload),
-        });
-
-        const result = (await response.json()) as {
-          ok: boolean;
-          error?: string;
-          errorCode?: number;
-          status?: number;
-          timestamp?: string;
-        };
-
-        if (!response.ok || !result.ok) {
-          throw new Error(result.error || `${pointLabel} 下发失败: HTTP ${response.status}`);
-        }
-
-        if (!NAVIGATION_SUCCESS_ERROR_CODES.has(result.errorCode ?? 0)) {
-          throw new Error(`${pointLabel} 返回 ErrorCode=${result.errorCode}`);
-        }
-
-        setTaskPoints((current) =>
-          current.map((point, pointIndex) => ({
-            ...point,
-            status: pointIndex <= index ? "done" : "queued",
-          })),
-        );
-        setTaskDispatchMessage(
-          `已下发 ${pointLabel}，返回 Status=${result.status ?? "-"}，时间 ${result.timestamp || "-"}`,
-        );
-
-        if (payload.PointInfo === 3) {
-          await submitRobotChargeAction(1, `${pointLabel} 为充电点，已到点，正在自动开始充电。`);
-          isCharging = true;
-          setTaskDispatchMessage(`${pointLabel} 为充电点，已自动下发开始充电。`);
-        }
-      }
-
-      setTaskDispatchStatus("prepared");
-      setTaskDispatchMessage(`已按顺序完成 ${navigationPayloads.length} 个点位的真实下发，请结合机器人实际执行状态继续验证。`);
+      const runId = crypto.randomUUID();
+      const homeChargeIndex = taskPoints[0]?.type === 3 && taskPoints.length > 1 ? 0 : null;
+      const nextSchedulerState: TaskSchedulerState = {
+        active: true,
+        runId,
+        currentIndex: 0,
+        phase: "dispatching_point",
+        navTimestampMarker: navigationRuntimeRef.current.timestamp,
+        homeChargeIndex,
+        homeChargePending: homeChargeIndex !== null,
+      };
+      taskSchedulerStateRef.current = nextSchedulerState;
+      setTaskSchedulerState(nextSchedulerState);
+      await dispatchTaskPoint(0, runId, homeChargeIndex, homeChargeIndex !== null);
     } catch (error) {
       const failedMessage = error instanceof Error ? error.message : "导航任务下发失败";
-      setTaskDispatchStatus("error");
-      setTaskPoints((current) =>
-        current.map((point) => {
-          if (point.status === "done") {
-            return point;
-          }
-          if (point.status === "running") {
-            return { ...point, status: "error" };
-          }
-          return { ...point, status: "draft" };
-        }),
-      );
-      setTaskDispatchMessage(failedMessage);
+      stopTaskScheduler("error", failedMessage);
     }
   };
 
@@ -1632,10 +2469,11 @@ export default function Home() {
 
         return {
           record_id: point.id.replace(/-/g, "") || `zyhz_${String(index + 1).padStart(3, "0")}`,
+          type: point.type,
           vel_line: 0.2,
           start_pose: pose,
           end_pose: pose,
-          action: {},
+          action: buildPathJobAction(point.actionPreset),
         };
       }),
       cmd: 2001,
@@ -2405,10 +3243,11 @@ export default function Home() {
                   <div className="flex flex-wrap gap-2">
                     <ControlButton
                       onClick={() => routeImportInputRef.current?.click()}
+                        disabled={taskDispatchStatus === "dispatching"}
                       className="border-emerald-400/40 bg-emerald-400/10 text-emerald-100 hover:bg-emerald-400/20"
                     >
                       <Upload className="h-4 w-4" />
-                      导入 JSONL
+                      导入路线文件
                     </ControlButton>
                     <input
                       ref={routeImportInputRef}
@@ -2421,6 +3260,9 @@ export default function Home() {
                 </div>
                 <div className="mt-3 rounded-2xl border border-white/10 bg-slate-950/40 px-3 py-2 text-sm text-slate-300">
                   {routeMessage}
+                </div>
+                <div className="mt-3 text-xs text-slate-500">
+                  导入/导出 `path_ZYHZ.json` 时，`action.warning.times` 统一表示报警灯持续时间（秒）。
                 </div>
               </div>
 
@@ -2448,8 +3290,8 @@ export default function Home() {
               <div className={`mt-4 inline-flex rounded-full border px-3 py-1.5 text-sm ${taskDispatchTone}`}>
                 {taskDispatchStatus === "idle" && "等待编辑任务点"}
                 {taskDispatchStatus === "prepared" && "顺序任务已准备"}
-                {taskDispatchStatus === "dispatching" && "正在真实顺序下发"}
-                {taskDispatchStatus === "error" && "顺序下发异常"}
+                {taskDispatchStatus === "dispatching" && "逐点调度执行中"}
+                {taskDispatchStatus === "error" && "逐点调度异常"}
               </div>
               <div className="mt-3 rounded-2xl border border-white/10 bg-white/[0.03] p-3 text-sm text-slate-300">
                 {taskDispatchMessage}
@@ -2461,7 +3303,7 @@ export default function Home() {
                   className="border-cyan-300/40 bg-cyan-400/10 text-cyan-100 hover:bg-cyan-400/20"
                 >
                   <Send className="h-4 w-4" />
-                  {taskDispatchStatus === "dispatching" ? "下发中" : "真实顺序下发"}
+                  {taskDispatchStatus === "dispatching" ? "执行中" : "逐点执行路线"}
                 </ControlButton>
                 <ControlButton
                   onClick={() => exportRouteToPathJson()}
@@ -2605,6 +3447,153 @@ export default function Home() {
                             ))}
                           </select>
                         </label>
+                      </div>
+                      <div className="mt-3 rounded-2xl border border-white/10 bg-slate-950/30 p-3">
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <div>
+                            <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">动作控制</div>
+                            <div className="mt-1 text-xs text-slate-400">
+                              云台 {point.actionPreset.capture.length} 组 · 报警灯/语音 {point.actionPreset.warning ? "已配置" : "未配置"}
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            className="inline-flex items-center gap-2 rounded-2xl border border-cyan-300/30 bg-cyan-400/10 px-3 py-2 text-xs text-cyan-100 transition hover:bg-cyan-400/20"
+                            disabled={taskDispatchStatus === "dispatching"}
+                            onClick={() => addTaskPointCapture(point.id)}
+                          >
+                            <Plus className="h-3.5 w-3.5" />
+                            添加云台动作
+                          </button>
+                        </div>
+
+                        <div className="mt-3 space-y-3">
+                          {point.actionPreset.capture.length === 0 ? (
+                            <div className="rounded-2xl border border-dashed border-white/10 bg-white/[0.02] px-3 py-3 text-xs text-slate-500">
+                              暂未配置云台动作。支持水平 0-360，俯仰 0-90，变倍 0-37，默认 1。
+                            </div>
+                          ) : (
+                            point.actionPreset.capture.map((capture, captureIndex) => (
+                              <div key={`${point.id}-capture-${captureIndex}`} className="rounded-2xl border border-white/10 bg-white/[0.03] p-3">
+                                <div className="flex items-center justify-between gap-3">
+                                  <div className="text-sm font-medium text-white">云台动作 {captureIndex + 1}</div>
+                                  <button
+                                    type="button"
+                                    className="rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs text-slate-300 transition hover:bg-white/[0.08]"
+                                    disabled={taskDispatchStatus === "dispatching"}
+                                    onClick={() => removeTaskPointCapture(point.id, captureIndex)}
+                                  >
+                                    删除
+                                  </button>
+                                </div>
+                                <div className="mt-3 grid gap-2 sm:grid-cols-3">
+                                  <label className="block">
+                                    <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">水平 0-360</div>
+                                    <input
+                                      type="number"
+                                      min={PTZ_PAN_RANGE.min}
+                                      max={PTZ_PAN_RANGE.max}
+                                      step="1"
+                                      className="mt-2 w-full rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
+                                      value={capture.panAngle}
+                                      disabled={taskDispatchStatus === "dispatching"}
+                                      onChange={(event) => updateTaskPointCaptureField(point.id, captureIndex, "panAngle", Number(event.target.value))}
+                                    />
+                                  </label>
+                                  <label className="block">
+                                    <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">俯仰 0-90</div>
+                                    <input
+                                      type="number"
+                                      min={PTZ_TILT_RANGE.min}
+                                      max={PTZ_TILT_RANGE.max}
+                                      step="1"
+                                      className="mt-2 w-full rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
+                                      value={capture.tiltAngle}
+                                      disabled={taskDispatchStatus === "dispatching"}
+                                      onChange={(event) => updateTaskPointCaptureField(point.id, captureIndex, "tiltAngle", Number(event.target.value))}
+                                    />
+                                  </label>
+                                  <label className="block">
+                                    <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">变倍 0-37</div>
+                                    <input
+                                      type="number"
+                                      min={PTZ_ZOOM_RANGE.min}
+                                      max={PTZ_ZOOM_RANGE.max}
+                                      step="1"
+                                      className="mt-2 w-full rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
+                                      value={capture.zoom}
+                                      disabled={taskDispatchStatus === "dispatching"}
+                                      onChange={(event) => updateTaskPointCaptureField(point.id, captureIndex, "zoom", Number(event.target.value))}
+                                    />
+                                  </label>
+                                </div>
+                              </div>
+                            ))
+                          )}
+                        </div>
+
+                        <div className="mt-3 rounded-2xl border border-white/10 bg-white/[0.03] p-3">
+                          <div className="flex flex-wrap items-center justify-between gap-3">
+                            <div>
+                              <div className="text-sm font-medium text-white">报警灯 / 语音</div>
+                              <div className="mt-1 text-xs text-slate-500">可单独控制语音、灯光和持续时间（秒）。</div>
+                            </div>
+                            <label className="inline-flex items-center gap-2 text-sm text-slate-300">
+                              <input
+                                type="checkbox"
+                                className="h-4 w-4 rounded border-white/20 bg-white/10"
+                                checked={Boolean(point.actionPreset.warning)}
+                                disabled={taskDispatchStatus === "dispatching"}
+                                onChange={(event) => setTaskPointWarningEnabled(point.id, event.target.checked)}
+                              />
+                              启用报警
+                            </label>
+                          </div>
+
+                          {point.actionPreset.warning ? (
+                            <div className="mt-3 grid gap-3 sm:grid-cols-3">
+                              <label className="flex items-center gap-2 rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-2 text-sm text-slate-300">
+                                <input
+                                  type="checkbox"
+                                  className="h-4 w-4 rounded border-white/20 bg-white/10"
+                                  checked={point.actionPreset.warning.voice}
+                                  disabled={taskDispatchStatus === "dispatching"}
+                                  onChange={(event) => updateTaskPointWarningField(point.id, "voice", event.target.checked)}
+                                />
+                                语音
+                              </label>
+                              <label className="flex items-center gap-2 rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-2 text-sm text-slate-300">
+                                <input
+                                  type="checkbox"
+                                  className="h-4 w-4 rounded border-white/20 bg-white/10"
+                                  checked={point.actionPreset.warning.light}
+                                  disabled={taskDispatchStatus === "dispatching"}
+                                  onChange={(event) => updateTaskPointWarningField(point.id, "light", event.target.checked)}
+                                />
+                                灯光
+                              </label>
+                              <label className="block">
+                                <div className="text-[11px] uppercase tracking-[0.2em] text-slate-500">点位延时（秒）</div>
+                                <input
+                                  type="number"
+                                  min={1}
+                                  step="1"
+                                  className="mt-2 w-full rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
+                                  value={point.actionPreset.warning.times}
+                                  disabled={taskDispatchStatus === "dispatching"}
+                                  onChange={(event) => updateTaskPointWarningField(point.id, "times", Number(event.target.value))}
+                                />
+                                <div className="mt-2 text-[11px] text-slate-500">
+                                  该值会作为报警灯接口的持续时间参数 `times` 原样下发。
+                                </div>
+                              </label>
+                            </div>
+                          ) : (
+                            <div className="mt-3 rounded-2xl border border-dashed border-white/10 bg-white/[0.02] px-3 py-3 text-xs text-slate-500">
+                              当前未启用报警灯控制。
+                            </div>
+                          )}
+                        </div>
                       </div>
                     </div>
                   ))
@@ -2753,6 +3742,33 @@ export default function Home() {
                 </div>
                 <div className="mt-1 text-xs text-slate-500">更新时间：{navigationRuntime.timestamp || "-"}</div>
               </div>
+              <div className="mt-3 rounded-2xl border border-white/10 bg-white/[0.03] p-3">
+                <div className="text-[11px] uppercase tracking-[0.25em] text-amber-100">充电状态</div>
+                <div className={`mt-2 inline-flex rounded-full border px-2.5 py-1 text-xs ${chargeRuntimeTone}`}>
+                  {chargeRuntime.connection === "loading" && "状态查询中"}
+                  {chargeRuntime.connection === "ready" && formatChargeRuntimeLabel(chargeRuntime.charge)}
+                  {chargeRuntime.connection === "error" && "状态查询异常"}
+                  {chargeRuntime.connection === "idle" && "等待上报"}
+                </div>
+                <div className="mt-2 text-xs text-slate-400">
+                  记录状态：{robotChargeState === "charging" ? "充电中" : robotChargeState === "idle" ? "空闲/未充电" : "未知"}
+                </div>
+                <div className="mt-1 text-xs text-slate-400">{chargeActionMessage}</div>
+                <div className="mt-1 text-xs text-slate-500">更新时间：{chargeRuntime.timestamp || "-"}</div>
+              </div>
+              <div className="mt-3 rounded-2xl border border-white/10 bg-white/[0.03] p-3">
+                <div className="text-[11px] uppercase tracking-[0.25em] text-fuchsia-100">动作状态</div>
+                <div className={`mt-2 inline-flex rounded-full border px-2.5 py-1 text-xs ${taskDispatchTone}`}>
+                  {taskDispatchStatus === "dispatching" && "路线执行中"}
+                  {taskDispatchStatus === "prepared" && "路线执行完成"}
+                  {taskDispatchStatus === "error" && "路线执行异常"}
+                  {taskDispatchStatus === "idle" && "等待执行"}
+                </div>
+                <div className="mt-2 text-xs text-slate-400">
+                  当前阶段：{formatTaskSchedulerPhaseLabel(taskSchedulerState.phase)}
+                </div>
+                <div className="mt-1 text-xs text-slate-300">{taskDispatchMessage}</div>
+              </div>
             </div>
 
             {taskEditorEnabled ? (
@@ -2785,7 +3801,181 @@ function reindexTaskPoints(points: TaskPoint[], fallbackYaw: number, resetStatus
       index: index + 1,
       label: `P${index + 1}`,
       yaw: Number.isFinite(point.yaw) ? point.yaw : fallbackYaw,
+      actionPreset: normalizeActionPreset(point.actionPreset),
       status: resetStatus ? "draft" : point.status,
+    };
+  });
+}
+
+function cloneActionPreset(actionPreset: TaskPointActionPreset = EMPTY_ACTION_PRESET): TaskPointActionPreset {
+  return {
+    capture: (actionPreset.capture ?? []).map((item) => ({
+      panAngle: clampCapturePanAngle(Number(item.panAngle ?? 0)),
+      tiltAngle: clampCaptureTiltAngle(Number(item.tiltAngle ?? 0)),
+      zoom: clampCaptureZoom(Number(item.zoom ?? 1)),
+    })),
+    warning: actionPreset.warning
+      ? {
+          voice: Boolean(actionPreset.warning.voice),
+          light: Boolean(actionPreset.warning.light),
+          times: clampWarningTimes(Number(actionPreset.warning.times ?? DEFAULT_WARNING_DURATION_SECONDS)),
+        }
+      : null,
+  };
+}
+
+function clampNumber(value: number, min: number, max: number, fallback: number) {
+  if (!Number.isFinite(value)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, value));
+}
+
+function clampCapturePanAngle(value: number) {
+  return clampNumber(value, PTZ_PAN_RANGE.min, PTZ_PAN_RANGE.max, 0);
+}
+
+function clampCaptureTiltAngle(value: number) {
+  return clampNumber(value, PTZ_TILT_RANGE.min, PTZ_TILT_RANGE.max, 0);
+}
+
+function clampCaptureZoom(value: number) {
+  return clampNumber(value, PTZ_ZOOM_RANGE.min, PTZ_ZOOM_RANGE.max, 1);
+}
+
+function clampWarningTimes(value: number) {
+  if (!Number.isFinite(value)) {
+    return DEFAULT_WARNING_DURATION_SECONDS;
+  }
+  return Math.max(1, Math.round(value));
+}
+
+function normalizeActionPreset(actionPreset: TaskPoint["actionPreset"] | undefined): TaskPointActionPreset {
+  return cloneActionPreset(actionPreset ?? EMPTY_ACTION_PRESET);
+}
+
+function buildPathJobAction(actionPreset: TaskPointActionPreset) {
+  const normalized = normalizeActionPreset(actionPreset);
+  const payload: {
+    capture?: Array<{ pan_angle: number; tilt_angle: number; zoom: number }>;
+    warning?: { voice: boolean; light: boolean; times: number };
+  } = {};
+
+  if (normalized.capture.length > 0) {
+    payload.capture = normalized.capture.map((item) => ({
+      pan_angle: Number(item.panAngle),
+      tilt_angle: Number(item.tiltAngle),
+      zoom: Number(item.zoom),
+    }));
+  }
+
+  if (normalized.warning) {
+    payload.warning = {
+      voice: normalized.warning.voice,
+      light: normalized.warning.light,
+      times: Number(normalized.warning.times),
+    };
+  }
+
+  return payload;
+}
+
+function parseImportedRouteFile(raw: string, fileName: string, fallbackYaw: number): TaskPoint[] {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    throw new Error("路线文件为空。");
+  }
+
+  if (trimmed.startsWith("{")) {
+    const parsed = JSON.parse(trimmed) as {
+      jobs?: Array<{
+        record_id?: string;
+        type?: number;
+        vel_line?: number;
+        end_pose?: { x?: number; y?: number; yaw?: number };
+        action?: {
+          capture?: Array<{ pan_angle?: number; tilt_angle?: number; zoom?: number }>;
+          warning?: { voice?: boolean; light?: boolean; times?: number };
+        };
+      }>;
+    };
+
+    if (!Array.isArray(parsed.jobs) || parsed.jobs.length === 0) {
+      throw new Error(`${fileName} 中未找到 jobs 路径点。`);
+    }
+
+    return parsed.jobs.map((job, index) => ({
+      id: typeof job.record_id === "string" && job.record_id.trim() ? job.record_id : crypto.randomUUID(),
+      index: index + 1,
+      label: `P${index + 1}`,
+      type: job.type === 0 || job.type === 1 || job.type === 3 ? job.type : 1,
+      x: Number(job.end_pose?.x ?? 0),
+      y: Number(job.end_pose?.y ?? 0),
+      z: 0,
+      yaw: Number(job.end_pose?.yaw ?? fallbackYaw),
+      gait: DEFAULT_NAVIGATION_TASK.Gait,
+      speed: DEFAULT_NAVIGATION_TASK.Speed,
+      manner: DEFAULT_NAVIGATION_TASK.Manner,
+      obsMode: DEFAULT_NAVIGATION_TASK.ObsMode,
+      navMode: DEFAULT_NAVIGATION_TASK.NavMode,
+      actionPreset: {
+        capture: Array.isArray(job.action?.capture)
+          ? job.action.capture.map((item) => ({
+              panAngle: Number(item.pan_angle ?? 0),
+              tiltAngle: Number(item.tilt_angle ?? 0),
+              zoom: Number(item.zoom ?? 1),
+            }))
+          : [],
+        warning: job.action?.warning
+          ? {
+              voice: Boolean(job.action.warning.voice),
+              light: Boolean(job.action.warning.light),
+              times: Number(job.action.warning.times ?? 1),
+            }
+          : null,
+      },
+      status: "draft",
+    }));
+  }
+
+  const lines = trimmed
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (lines.length === 0) {
+    throw new Error("JSONL 文件为空。");
+  }
+
+  return lines.map((line, index) => {
+    const item = JSON.parse(line) as Partial<TaskPoint> & {
+      type?: number;
+      gait?: number;
+      speed?: number;
+      manner?: number;
+      obs_mode?: number;
+      nav_mode?: number;
+      obsMode?: number;
+      navMode?: number;
+    };
+
+    const type = item.type === 0 || item.type === 1 || item.type === 3 ? item.type : 1;
+    return {
+      id: item.id ?? crypto.randomUUID(),
+      index: index + 1,
+      label: typeof item.label === "string" && item.label.trim() ? item.label : `P${index + 1}`,
+      type,
+      x: Number(item.x ?? 0),
+      y: Number(item.y ?? 0),
+      z: Number(item.z ?? 0),
+      yaw: Number(item.yaw ?? fallbackYaw),
+      gait: Number(item.gait ?? DEFAULT_NAVIGATION_TASK.Gait),
+      speed: Number(item.speed ?? DEFAULT_NAVIGATION_TASK.Speed),
+      manner: Number(item.manner ?? DEFAULT_NAVIGATION_TASK.Manner),
+      obsMode: Number(item.obsMode ?? item.obs_mode ?? DEFAULT_NAVIGATION_TASK.ObsMode),
+      navMode: Number(item.navMode ?? item.nav_mode ?? DEFAULT_NAVIGATION_TASK.NavMode),
+      actionPreset: normalizeActionPreset(item.actionPreset),
+      status: "draft",
     };
   });
 }
@@ -2801,9 +3991,28 @@ function formatTaskPointStatus(status: TaskPoint["status"]) {
     return "已完成";
   }
   if (status === "error") {
-    return "下发异常";
+    return "执行异常";
   }
   return "草稿";
+}
+
+function formatTaskSchedulerPhaseLabel(phase: TaskSchedulerPhase) {
+  if (phase === "dispatching_point") {
+    return "下发导航点";
+  }
+  if (phase === "waiting_start") {
+    return "等待开始导航";
+  }
+  if (phase === "waiting_arrival") {
+    return "等待到达点位";
+  }
+  if (phase === "executing_capture") {
+    return "执行云台动作";
+  }
+  if (phase === "executing_warning") {
+    return "执行报警灯动作";
+  }
+  return "空闲";
 }
 
 function formatNavigationStatusLabel(status: number | null) {

@@ -1,0 +1,87 @@
+{
+  "taskId": "b6f1e13b0b864c51a366f26d6f3f5a8c",
+  "sn": "CM20111188",
+  "mapId": "map",
+  "jobs": [
+    {
+      "record_id": "zyhz_001",
+      "type": 3,
+      "vel_line": 0.2,
+      "start_pose": {
+        "x": -0.38,
+        "y": -0.17,
+        "yaw": 0
+      },
+      "end_pose": {
+        "x": -0.38,
+        "y": -0.17,
+        "yaw": 0
+      },
+      "action": {}
+    },
+    {
+      "record_id": "zyhz_002",
+      "type": 1,
+      "vel_line": 0.2,
+      "start_pose": {
+        "x": -0.38,
+        "y": 0.05,
+        "yaw": -2.93
+      },
+      "end_pose": {
+        "x": -0.38,
+        "y": 0.05,
+        "yaw": -2.93
+      },
+      "action": {
+        "capture": [
+          {
+            "pan_angle": 45,
+            "tilt_angle": 20,
+            "zoom": 3
+          },
+          {
+            "pan_angle": -45,
+            "tilt_angle": 20,
+            "zoom": 3
+          }
+        ],
+        "warning": {
+          "voice": true,
+          "light": true,
+          "times": 3
+        }
+      }
+    },
+    {
+      "record_id": "zyhz_003",
+      "type": 1,
+      "vel_line": 0.2,
+      "start_pose": {
+        "x": 0.28,
+        "y": 1.5,
+        "yaw": 1.5
+      },
+      "end_pose": {
+        "x": 0.28,
+        "y": 1.5,
+        "yaw": 1.5
+      },
+      "action": {
+        "capture": [
+          {
+            "pan_angle": 0,
+            "tilt_angle": 30,
+            "zoom": 4
+          }
+        ],
+        "warning": {
+          "voice": false,
+          "light": true,
+          "times": 5
+        }
+      }
+    }
+  ],
+  "cmd": 2001
+}

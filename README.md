@@ -108,7 +108,7 @@ curl -I http://localhost:4174
 
 ```bash
 M20_ROBOT_HOST=10.21.31.103     # 改成你的机器人 IP
-M20_MAPPING_HOST=10.21.33.106   # 改成你的建图网关 IP
+M20_MAPPING_HOST=10.21.31.106   # 改成你的建图网关 IP
 M20_DEFAULT_MAP_ASSET_NAME=siteB-20260616-105415  # 默认加载的地图名
 APP_PORT=4174                   # 对外访问端口
 ```
@@ -147,6 +147,14 @@ sudo apt install -y docker-compose-v2
 ```
 
 然后 `sudo systemctl restart docker`，再重新 `./start-docker.sh`。
+
+如果你只想给当前项目临时切换基础镜像，也可以在根目录 `.env` 里增加：
+
+```bash
+NODE_IMAGE=docker.m.daocloud.io/library/node:24-bookworm-slim
+```
+
+这样 `Dockerfile` 会改用镜像站中的 Node 基础镜像重新构建。
 
 **Q: 启动时看到 `buildx isn't installed`？**
 
@@ -199,7 +207,7 @@ npm run dev -- --host 0.0.0.0 --port 4174
 ```bash
 export M20_ROBOT_HOST=10.21.31.103
 export M20_ROBOT_PORT=30001
-export M20_MAPPING_HOST=10.21.33.106
+export M20_MAPPING_HOST=10.21.31.106
 export M20_MAPPING_PORT=30100
 ```
 
@@ -343,7 +351,7 @@ open-inspection-platform/
 
 ### 建图网关协议（UDP）
 
-- 默认地址: `10.21.33.106:30100`
+- 默认地址: `10.21.31.106:30100`
 - 协议文档: [m20_mapping_udp_protocol.md](m20_mapping_udp_protocol.md)
 
 | API | 协议 | 说明 |
@@ -371,7 +379,7 @@ open-inspection-platform/
 |---|---|---|
 | `M20_ROBOT_HOST` | `10.21.31.103` | 机器人 TCP 地址 |
 | `M20_ROBOT_PORT` | `30001` | 机器人 TCP 端口 |
-| `M20_MAPPING_HOST` | `10.21.33.106` | 建图 UDP 网关地址 |
+| `M20_MAPPING_HOST` | `10.21.31.106` | 建图 UDP 网关地址 |
 | `M20_MAPPING_PORT` | `30100` | 建图 UDP 网关端口 |
 | `M20_MAPS_DIR` | `data/maps` | 地图资源目录 |
 | `M20_PCD_SAMPLE_DIR` | `data/pcd_samples` | PCD 样例目录 |

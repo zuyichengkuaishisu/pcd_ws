@@ -2,6 +2,23 @@ export type TaskPointType = 0 | 1 | 3;
 
 export type TaskPointStatus = "draft" | "queued" | "running" | "done" | "error";
 
+export type TaskPointCapturePreset = {
+  panAngle: number;
+  tiltAngle: number;
+  zoom: number;
+};
+
+export type TaskPointWarningPreset = {
+  voice: boolean;
+  light: boolean;
+  times: number;
+};
+
+export type TaskPointActionPreset = {
+  capture: TaskPointCapturePreset[];
+  warning: TaskPointWarningPreset | null;
+};
+
 export type TaskPoint = {
   id: string;
   index: number;
@@ -16,6 +33,7 @@ export type TaskPoint = {
   manner: number;
   obsMode: number;
   navMode: number;
+  actionPreset: TaskPointActionPreset;
   status: TaskPointStatus;
 };
 

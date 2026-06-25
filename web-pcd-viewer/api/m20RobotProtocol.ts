@@ -76,7 +76,7 @@ export type RobotAxisControlPayload = {
   yaw: number;
 };
 
-export type RobotChargeAction = 0 | 1;
+export type RobotChargeAction = 0 | 1 | 2;
 export type RobotMotionAction = 0 | 1 | 2 | 3 | 4 | 17;
 
 export type RobotChargeResponse = {

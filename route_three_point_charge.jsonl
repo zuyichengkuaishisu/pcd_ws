@@ -1,0 +1,3 @@
+{"index":1,"label":"P1","type":3,"type_name":"充电点","x":-0.38,"y":-0.17,"z":0,"yaw":0,"gait":12290,"speed":0,"manner":0,"obs_mode":0,"nav_mode":1,"actionPreset":{"capture":[],"warning":null}}
+{"index":2,"label":"P2","type":1,"type_name":"任务点","x":-0.38,"y":0.05,"z":0,"yaw":-2.93,"gait":12290,"speed":0,"manner":0,"obs_mode":0,"nav_mode":1,"actionPreset":{"capture":[{"panAngle":45,"tiltAngle":20,"zoom":3},{"panAngle":-45,"tiltAngle":20,"zoom":3}],"warning":{"voice":true,"light":true,"times":3}}}
+{"index":3,"label":"P3","type":1,"type_name":"任务点","x":0.28,"y":1.5,"z":0,"yaw":1.5,"gait":12290,"speed":0,"manner":0,"obs_mode":0,"nav_mode":1,"actionPreset":{"capture":[{"panAngle":0,"tiltAngle":30,"zoom":4}],"warning":{"voice":false,"light":true,"times":5}}}

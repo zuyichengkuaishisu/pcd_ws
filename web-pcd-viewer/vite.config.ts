@@ -1,4 +1,5 @@
 import { readdir, readFile } from "node:fs/promises";
+import dgram from "node:dgram";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,8 +32,10 @@ import {
 
 const ROBOT_HOST = process.env.M20_ROBOT_HOST ?? "10.21.31.103";
 const ROBOT_PORT = Number(process.env.M20_ROBOT_PORT ?? "30001");
+const ROBOT_UDP_PORT = Number(process.env.M20_ROBOT_UDP_PORT ?? "30000");
 const MAPPING_HOST = process.env.M20_MAPPING_HOST ?? "10.21.33.106";
 const MAPPING_PORT = Number(process.env.M20_MAPPING_PORT ?? "30100");
+const AGENT_BASE_URL = (process.env.M20_AGENT_BASE_URL ?? "http://10.21.31.104:9900").replace(/\/+$/, "");
 const PROJECT_DIR = dirname(fileURLToPath(import.meta.url));
 const WORKSPACE_DIR = resolve(PROJECT_DIR, "..");
 const MAPS_DIR = process.env.M20_MAPS_DIR ? resolve(process.env.M20_MAPS_DIR) : resolve(WORKSPACE_DIR, "data/maps");
@@ -40,6 +43,9 @@ const PCD_SAMPLE_DIR = process.env.M20_PCD_SAMPLE_DIR
   ? resolve(process.env.M20_PCD_SAMPLE_DIR)
   : resolve(WORKSPACE_DIR, "data/pcd_samples");
 const DEFAULT_PCD_ID = "sample:outside_15cm_simpled.pcd";
+const HEARTBEAT_INTERVAL_MS = Number(process.env.M20_HEARTBEAT_INTERVAL_MS ?? "1000");
+const HEARTBEAT_STALE_MS = Number(process.env.M20_HEARTBEAT_STALE_MS ?? "5000");
+const PATROL_SYNC_HEADER = Buffer.from([0xeb, 0x91, 0xeb, 0x90]);
 
 type ApiHandler = (req: IncomingMessage, res: ServerResponse<IncomingMessage>) => Promise<void>;
 type RobotEndpointConfig = {
@@ -58,6 +64,188 @@ type PcdAsset = {
   mapName?: string;
   hasLinkedOccGrid: boolean;
 };
+type AgentPtzGotoPayload = {
+  channel?: number;
+  pan_angle: number;
+  tilt_angle: number;
+  zoom?: number;
+};
+type AgentLightControlPayload = {
+  voice?: boolean;
+  light?: boolean;
+  times?: number;
+};
+type RobotChargeRuntimeSnapshot = {
+  connection: "idle" | "ready" | "error";
+  charge: number | null;
+  motionState: number | null;
+  timestamp: string;
+  sourceHost: string;
+  sourcePort: number | null;
+  localPort: number | null;
+  message: string;
+  error: string;
+};
+
+function formatProtocolTime() {
+  const now = new Date();
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+}
+
+function nextMessageId() {
+  return Math.floor(Math.random() * 0xffff);
+}
+
+function buildPatrolJsonPacket(body: Record<string, unknown>) {
+  const payload = Buffer.from(JSON.stringify(body), "utf-8");
+  const header = Buffer.concat([
+    PATROL_SYNC_HEADER,
+    Buffer.from(Uint16Array.of(payload.length).buffer),
+    Buffer.from(Uint16Array.of(nextMessageId()).buffer),
+    Buffer.from([0x01]),
+    Buffer.alloc(7, 0),
+  ]);
+  return Buffer.concat([header, payload]);
+}
+
+function parsePatrolJsonFrame(message: Buffer) {
+  if (message.length < 16 || !message.subarray(0, 4).equals(PATROL_SYNC_HEADER)) {
+    return null;
+  }
+  const asduLength = message.readUInt16LE(4);
+  const asduFormat = message.readUInt8(8);
+  if (asduFormat !== 0x01 || message.length < 16 + asduLength) {
+    return null;
+  }
+  try {
+    return JSON.parse(message.subarray(16, 16 + asduLength).toString("utf-8")) as {
+      PatrolDevice?: {
+        Type?: number;
+        Command?: number;
+        Time?: string;
+        Items?: Record<string, unknown>;
+      };
+    };
+  } catch {
+    return null;
+  }
+}
+
+class RobotChargeRuntimeBridge {
+  private socket: dgram.Socket | null = null;
+  private started = false;
+  private lastUpdatedAt = 0;
+  private snapshot: RobotChargeRuntimeSnapshot = {
+    connection: "idle",
+    charge: null,
+    motionState: null,
+    timestamp: "",
+    sourceHost: "",
+    sourcePort: null,
+    localPort: null,
+    message: "等待机器人基础状态上报。",
+    error: "",
+  };
+
+  start() {
+    if (this.started) {
+      return;
+    }
+
+    this.started = true;
+    this.socket = dgram.createSocket("udp4");
+
+    this.socket.on("message", (message, remoteInfo) => {
+      const parsed = parsePatrolJsonFrame(message);
+      const patrol = parsed?.PatrolDevice;
+      const basicStatus =
+        patrol?.Type === 1002 && patrol?.Command === 6 && patrol.Items && typeof patrol.Items.BasicStatus === "object"
+          ? (patrol.Items.BasicStatus as Record<string, unknown>)
+          : null;
+
+      if (!basicStatus) {
+        return;
+      }
+
+      this.lastUpdatedAt = Date.now();
+      this.snapshot = {
+        connection: "ready",
+        charge: Number(basicStatus.Charge ?? 0),
+        motionState: Number(basicStatus.MotionState ?? 0),
+        timestamp: patrol?.Time ?? "",
+        sourceHost: remoteInfo.address,
+        sourcePort: remoteInfo.port,
+        localPort: this.snapshot.localPort,
+        message: "已收到机器人基础状态上报。",
+        error: "",
+      };
+    });
+
+    this.socket.on("error", (error) => {
+      this.snapshot = {
+        ...this.snapshot,
+        connection: "error",
+        message: "机器人基础状态桥接异常。",
+        error: error.message,
+      };
+    });
+
+    this.socket.bind(0, "0.0.0.0", () => {
+      if (!this.socket) {
+        return;
+      }
+      const address = this.socket.address();
+      this.snapshot = {
+        ...this.snapshot,
+        localPort: typeof address === "string" ? null : address.port,
+        message: "心跳监听已启动，等待机器人基础状态上报。",
+        error: "",
+      };
+      this.sendHeartbeat();
+      setInterval(() => {
+        this.sendHeartbeat();
+      }, HEARTBEAT_INTERVAL_MS);
+    });
+  }
+
+  getSnapshot(): RobotChargeRuntimeSnapshot {
+    if (this.snapshot.connection === "ready" && this.lastUpdatedAt > 0 && Date.now() - this.lastUpdatedAt > HEARTBEAT_STALE_MS) {
+      return {
+        ...this.snapshot,
+        connection: "idle",
+        message: "基础状态上报已超时，等待新的心跳状态。",
+      };
+    }
+    return this.snapshot;
+  }
+
+  private sendHeartbeat() {
+    if (!this.socket) {
+      return;
+    }
+    const packet = buildPatrolJsonPacket({
+      PatrolDevice: {
+        Type: 100,
+        Command: 100,
+        Time: formatProtocolTime(),
+        Items: {},
+      },
+    });
+    this.socket.send(packet, ROBOT_UDP_PORT, ROBOT_HOST, (error) => {
+      if (error) {
+        this.snapshot = {
+          ...this.snapshot,
+          connection: "error",
+          message: "发送心跳失败。",
+          error: error.message,
+        };
+      }
+    });
+  }
+}
+
+const robotChargeRuntimeBridge = new RobotChargeRuntimeBridge();
 
 async function readJsonBody(req: IncomingMessage) {
   const chunks: Buffer[] = [];
@@ -66,6 +254,40 @@ async function readJsonBody(req: IncomingMessage) {
   }
   const raw = Buffer.concat(chunks).toString("utf-8");
   return raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+}
+
+async function postAgentJson<TPayload extends Record<string, unknown>>(path: string, payload: TPayload) {
+  const response = await fetch(`${AGENT_BASE_URL}${path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const text = await response.text();
+  let data: unknown = null;
+  if (text) {
+    try {
+      data = JSON.parse(text) as unknown;
+    } catch {
+      data = text;
+    }
+  }
+
+  if (!response.ok) {
+    const errorMessage =
+      typeof data === "object" && data !== null && "message" in data && typeof (data as { message?: unknown }).message === "string"
+        ? (data as { message: string }).message
+        : `Agent 接口请求失败: HTTP ${response.status}`;
+    throw new Error(errorMessage);
+  }
+
+  return {
+    status: response.status,
+    data,
+  };
 }
 
 async function listAvailablePcdAssets() {
@@ -546,9 +768,9 @@ function createRobotChargeHandler(): ApiHandler {
     try {
       const body = await readJsonBody(req);
       const charge = Number(body.charge) as RobotChargeAction;
-      if (![0, 1].includes(charge)) {
+      if (![0, 1, 2].includes(charge)) {
         res.statusCode = 400;
-        res.end(JSON.stringify({ ok: false, error: "充电参数无效，仅支持 `1` 开始充电或 `0` 结束充电" }));
+        res.end(JSON.stringify({ ok: false, error: "充电参数无效，仅支持 `1` 开始充电、`0` 结束充电或 `2` 清除充电状态并退桩" }));
         return;
       }
 
@@ -566,6 +788,23 @@ function createRobotChargeHandler(): ApiHandler {
         }),
       );
     }
+  };
+}
+
+function createRobotChargeRuntimeHandler(): ApiHandler {
+  return async (req, res) => {
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+
+    if (req.method !== "GET") {
+      res.statusCode = 405;
+      res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
+      return;
+    }
+
+    robotChargeRuntimeBridge.start();
+    res.statusCode = 200;
+    res.end(JSON.stringify({ ok: true, ...robotChargeRuntimeBridge.getSnapshot() }));
   };
 }
 
@@ -647,6 +886,90 @@ function createRobotAxisControlHandler(): ApiHandler {
           error: error instanceof Error ? error.message : "轴指令下发失败",
           host: ROBOT_HOST,
           port: ROBOT_PORT,
+        }),
+      );
+    }
+  };
+}
+
+function createAgentPtzGotoHandler(): ApiHandler {
+  return async (req, res) => {
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+
+    if (req.method !== "POST") {
+      res.statusCode = 405;
+      res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
+      return;
+    }
+
+    try {
+      const body = await readJsonBody(req);
+      const payload: AgentPtzGotoPayload = {
+        channel: Number(body.channel ?? 1),
+        pan_angle: Number(body.pan_angle),
+        tilt_angle: Number(body.tilt_angle),
+        zoom: Number(body.zoom ?? 1),
+      };
+
+      const hasInvalidValue = [payload.channel, payload.pan_angle, payload.tilt_angle, payload.zoom].some((value) => Number.isNaN(value));
+      if (hasInvalidValue) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ ok: false, error: "云台参数无效，需要 channel/pan_angle/tilt_angle/zoom 数值" }));
+        return;
+      }
+
+      const result = await postAgentJson("/api/agent/hk/ptz/goto", payload as Record<string, unknown>);
+      res.statusCode = 200;
+      res.end(JSON.stringify({ ok: true, agentBaseUrl: AGENT_BASE_URL, ...result }));
+    } catch (error) {
+      res.statusCode = 502;
+      res.end(
+        JSON.stringify({
+          ok: false,
+          error: error instanceof Error ? error.message : "云台控制失败",
+          agentBaseUrl: AGENT_BASE_URL,
+        }),
+      );
+    }
+  };
+}
+
+function createAgentLightControlHandler(): ApiHandler {
+  return async (req, res) => {
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+
+    if (req.method !== "POST") {
+      res.statusCode = 405;
+      res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
+      return;
+    }
+
+    try {
+      const body = await readJsonBody(req);
+      const payload: AgentLightControlPayload = {
+        voice: Boolean(body.voice ?? false),
+        light: Boolean(body.light ?? true),
+        times: Number(body.times ?? 10),
+      };
+
+      if (Number.isNaN(payload.times)) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ ok: false, error: "报警灯参数无效，需要 times 数值" }));
+        return;
+      }
+
+      const result = await postAgentJson("/api/agent/light/control", payload as Record<string, unknown>);
+      res.statusCode = 200;
+      res.end(JSON.stringify({ ok: true, agentBaseUrl: AGENT_BASE_URL, ...result }));
+    } catch (error) {
+      res.statusCode = 502;
+      res.end(
+        JSON.stringify({
+          ok: false,
+          error: error instanceof Error ? error.message : "报警灯控制失败",
+          agentBaseUrl: AGENT_BASE_URL,
         }),
       );
     }
@@ -967,8 +1290,11 @@ function robotPoseApiPlugin() {
   const navigationTaskStatusHandler = createNavigationTaskStatusHandler();
   const navigationTaskCancelHandler = createNavigationTaskCancelHandler();
   const robotChargeHandler = createRobotChargeHandler();
+  const robotChargeRuntimeHandler = createRobotChargeRuntimeHandler();
   const robotSoftEstopHandler = createRobotSoftEstopHandler();
   const robotAxisControlHandler = createRobotAxisControlHandler();
+  const agentPtzGotoHandler = createAgentPtzGotoHandler();
+  const agentLightControlHandler = createAgentLightControlHandler();
   const occGridMetaHandler = createOccGridMetaHandler();
   const occGridImageHandler = createOccGridImageHandler();
   const pcdHandler = createPcdHandler();
@@ -982,6 +1308,7 @@ function robotPoseApiPlugin() {
   return {
     name: "robot-pose-api",
     configureServer(server: { middlewares: { use: (path: string, fn: ApiHandler) => void } }) {
+      robotChargeRuntimeBridge.start();
       server.middlewares.use("/api/robot/pose", poseHandler);
       server.middlewares.use("/api/robots/poses", posesHandler);
       server.middlewares.use("/api/robot/initial-pose", initialPoseHandler);
@@ -989,8 +1316,11 @@ function robotPoseApiPlugin() {
       server.middlewares.use("/api/robot/navigation-task-status", navigationTaskStatusHandler);
       server.middlewares.use("/api/robot/navigation-task-cancel", navigationTaskCancelHandler);
       server.middlewares.use("/api/robot/charge", robotChargeHandler);
+      server.middlewares.use("/api/robot/charge-runtime", robotChargeRuntimeHandler);
       server.middlewares.use("/api/robot/soft-estop", robotSoftEstopHandler);
       server.middlewares.use("/api/robot/axis-control", robotAxisControlHandler);
+      server.middlewares.use("/api/agent/ptz/goto", agentPtzGotoHandler);
+      server.middlewares.use("/api/agent/light/control", agentLightControlHandler);
       server.middlewares.use("/api/mapping/status", mappingStatusHandler);
       server.middlewares.use("/api/mapping/start", mappingStartHandler);
       server.middlewares.use("/api/mapping/stop", mappingStopHandler);
@@ -1002,6 +1332,7 @@ function robotPoseApiPlugin() {
       server.middlewares.use("/api/map/occ-grid/image", occGridImageHandler);
     },
     configurePreviewServer(server: { middlewares: { use: (path: string, fn: ApiHandler) => void } }) {
+      robotChargeRuntimeBridge.start();
       server.middlewares.use("/api/robot/pose", poseHandler);
       server.middlewares.use("/api/robots/poses", posesHandler);
       server.middlewares.use("/api/robot/initial-pose", initialPoseHandler);
@@ -1009,8 +1340,11 @@ function robotPoseApiPlugin() {
       server.middlewares.use("/api/robot/navigation-task-status", navigationTaskStatusHandler);
       server.middlewares.use("/api/robot/navigation-task-cancel", navigationTaskCancelHandler);
       server.middlewares.use("/api/robot/charge", robotChargeHandler);
+      server.middlewares.use("/api/robot/charge-runtime", robotChargeRuntimeHandler);
       server.middlewares.use("/api/robot/soft-estop", robotSoftEstopHandler);
       server.middlewares.use("/api/robot/axis-control", robotAxisControlHandler);
+      server.middlewares.use("/api/agent/ptz/goto", agentPtzGotoHandler);
+      server.middlewares.use("/api/agent/light/control", agentLightControlHandler);
       server.middlewares.use("/api/mapping/status", mappingStatusHandler);
       server.middlewares.use("/api/mapping/start", mappingStartHandler);
       server.middlewares.use("/api/mapping/stop", mappingStopHandler);

@@ -33,7 +33,21 @@ fi
 
 echo "Starting Open Inspection Platform with Docker..."
 "${COMPOSE_CMD[@]}" -f "$ROOT_DIR/docker-compose.yml" down --remove-orphans 2>/dev/null || true
-"${COMPOSE_CMD[@]}" -f "$ROOT_DIR/docker-compose.yml" up -d --build
+if ! BUILD_OUTPUT="$("${COMPOSE_CMD[@]}" -f "$ROOT_DIR/docker-compose.yml" up -d --build 2>&1)"; then
+  echo "$BUILD_OUTPUT"
+  echo ""
+  if grep -Eq "failed to resolve source metadata|registry-1\\.docker\\.io|i/o timeout|DeadlineExceeded" <<<"$BUILD_OUTPUT"; then
+    echo "Docker failed to pull the Node base image from Docker Hub."
+    echo "If Docker Hub is slow or blocked in your network, pick one of these fixes:"
+    echo "  1. Set NODE_IMAGE in $ROOT_DIR/.env and retry."
+    echo "     Example: NODE_IMAGE=docker.m.daocloud.io/library/node:24-bookworm-slim"
+    echo "  2. Configure Docker registry mirrors, then restart Docker."
+    echo "     Example mirrors: https://docker.1ms.run , https://docker.xuanyuan.me"
+  fi
+  exit 1
+fi
+
+echo "$BUILD_OUTPUT"
 
 APP_PORT="${APP_PORT:-4174}"
 if [[ -f "$ROOT_DIR/.env" ]]; then

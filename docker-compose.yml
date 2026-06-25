@@ -3,6 +3,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        NODE_IMAGE: "${NODE_IMAGE:-node:24-bookworm-slim}"
     image: open-inspection-platform:latest
     container_name: open-inspection-platform
     ports:

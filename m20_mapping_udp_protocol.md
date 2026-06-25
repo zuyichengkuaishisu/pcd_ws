@@ -12,7 +12,7 @@
 | 协议 | 部署位置 | 默认地址 | 端口 | 职责 |
 |------|----------|----------|------|------|
 | 本体监控协议（PatrolDevice） | 运控板 | `10.21.31.103` | UDP `30000` / TCP `30001` | 运动、充电、§7.4 导航等 |
-| **本协议（SlamGateway）** | **导航主机 NOS** | **`10.21.33.106`**（示例） | **UDP `30100`** | **建图 / 地图管理** |
+| **本协议（SlamGateway）** | **导航主机 NOS** | **`10.21.31.106`**（实机） | **UDP `30100`** | **建图 / 地图管理** |
 
 设计原则：
 
@@ -36,7 +36,7 @@
 | 项目 | 默认值 | 备注 |
 |------|--------|------|
 | 协议 | UDP | 仅 UDP；建图为长任务，靠状态轮询 |
-| 服务端 IP | NOS 地址 | 示例 `10.21.33.106`，以现场为准 |
+| 服务端 IP | NOS 地址 | 当前实机 `10.21.31.106`，以现场为准 |
 | 服务端端口 | `30100` | 可配置 |
 | ASDU 格式 | JSON | `0x01` |
 | 编码 | UTF-8 | |
@@ -473,7 +473,7 @@ def call(cmd: int, items: dict) -> dict:
         }
     }).encode()
     apdu, mid = build_apdu(asdu)
-    sock.sendto(apdu, ("10.21.33.106", 30100))
+    sock.sendto(apdu, ("10.21.31.106", 30100))
     data, _ = sock.recvfrom(65535)
     return parse_response(data)
 
@@ -535,10 +535,10 @@ python3 ~/m20_slam/scripts/test_mapping_udp_client.py status
 ### 典型联调
 
 ```bash
-python3 ~/m20_slam/scripts/test_mapping_udp_client.py --host 10.21.33.106 status
-python3 ~/m20_slam/scripts/test_mapping_udp_client.py --host 10.21.33.106 start --name siteA
-python3 ~/m20_slam/scripts/test_mapping_udp_client.py --host 10.21.33.106 stop
-python3 ~/m20_slam/scripts/test_mapping_udp_client.py --host 10.21.33.106 wait-idle
+python3 ~/m20_slam/scripts/test_mapping_udp_client.py --host 10.21.31.106 status
+python3 ~/m20_slam/scripts/test_mapping_udp_client.py --host 10.21.31.106 start --name siteA
+python3 ~/m20_slam/scripts/test_mapping_udp_client.py --host 10.21.31.106 stop
+python3 ~/m20_slam/scripts/test_mapping_udp_client.py --host 10.21.31.106 wait-idle
 python3 ~/m20_slam/scripts/test_mapping_udp_client.py list
 python3 ~/m20_slam/scripts/test_mapping_udp_client.py apply \
   --map-name map-20260611-170905 --timeout 120
