@@ -96,6 +96,7 @@ export type MappingStartPayload = {
 };
 
 export type MappingListItem = {
+  mapDir: string;
   name: string;
   path: string;
   isActive: boolean;
@@ -124,6 +125,7 @@ export type MappingStatusResponse = {
   slamProcess: string;
   maps: MappingListItem[];
   artifacts: MappingArtifacts | null;
+  deletedMapDir: string;
   timestamp: string;
   host: string;
   port: number;
@@ -330,9 +332,13 @@ function parseMappingList(items: Record<string, unknown>) {
   const maps = Array.isArray(items.Maps) ? items.Maps : [];
   return maps.map((entry) => {
     const record = typeof entry === "object" && entry !== null ? (entry as Record<string, unknown>) : {};
+    const mapDir = String(record.MapDir ?? record.Path ?? record.Name ?? "");
+    const name = String(record.Name ?? record.MapDir ?? record.Path ?? "");
+    const path = String(record.Path ?? record.MapDir ?? "");
     return {
-      name: String(record.Name ?? ""),
-      path: String(record.Path ?? ""),
+      mapDir,
+      name,
+      path,
       isActive: Boolean(record.IsActive),
       mtime: String(record.Mtime ?? ""),
       artifactsOk: Boolean(record.ArtifactsOk),
@@ -371,11 +377,12 @@ function parseMappingResponse(payload: Buffer, host: string, port: number): Mapp
     localizationService: String(items.LocalizationService ?? ""),
     rsdriverService: String(items.RsdriverService ?? ""),
     activeMapDir: String(items.ActiveMapDir ?? ""),
-    activeMapName: String(items.ActiveMapName ?? items.MapName ?? ""),
+    activeMapName: String(items.ActiveMapName ?? items.MapName ?? items.ActiveMapDir ?? ""),
     artifactsOk: Boolean(items.ArtifactsOk),
     slamProcess: String(items.SlamProcess ?? ""),
     maps: parseMappingList(items),
     artifacts: parseMappingArtifacts(items),
+    deletedMapDir: String(items.DeletedMapDir ?? ""),
     timestamp: parsed.SlamGateway?.Time ?? "",
     host,
     port,
@@ -806,6 +813,31 @@ export async function listLocalMaps(
         Items: {
           ...(payload.limit !== undefined ? { Limit: payload.limit } : {}),
           ...(payload.sortBy ? { SortBy: payload.sortBy } : {}),
+        },
+      },
+    },
+    timeoutMs,
+  );
+  return parseMappingResponse(response, host, port);
+}
+
+export async function deleteLocalMap(
+  host: string,
+  port: number,
+  payload: { mapDir?: string; mapName?: string },
+  timeoutMs = 120000,
+) {
+  const response = await sendSlamGatewayJsonRequest(
+    host,
+    port,
+    {
+      SlamGateway: {
+        Type: 2200,
+        Command: 5,
+        Time: formatProtocolTime(),
+        Items: {
+          ...(payload.mapDir ? { MapDir: payload.mapDir } : {}),
+          ...(payload.mapName ? { MapName: payload.mapName } : {}),
         },
       },
     },

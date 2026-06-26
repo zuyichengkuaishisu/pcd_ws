@@ -218,6 +218,7 @@ type PausedTaskSchedulerSnapshot = {
 };
 
 type MappingMapSummary = {
+  mapDir: string;
   name: string;
   path: string;
   isActive: boolean;
@@ -238,6 +239,14 @@ type MappingRuntimeState = {
   artifactsOk: boolean;
   maps: MappingMapSummary[];
   timestamp: string;
+};
+
+type MappingDeleteResult = {
+  ok: boolean;
+  error?: string;
+  errorCode?: number;
+  errorMessage?: string;
+  deletedMapDir?: string;
 };
 
 type AgentPtzPosition = {
@@ -448,6 +457,7 @@ export default function Home() {
   const [mappingActionStatus, setMappingActionStatus] = useState<"idle" | "submitting" | "success" | "error">("idle");
   const [mappingActionMessage, setMappingActionMessage] = useState("手动控制开始建图、停止建图和切换导航地图。");
   const [mappingApplyingName, setMappingApplyingName] = useState("");
+  const [mappingDeletingName, setMappingDeletingName] = useState("");
   const [mappingRuntime, setMappingRuntime] = useState<MappingRuntimeState>({
     connection: "idle",
     taskState: "",
@@ -2448,6 +2458,55 @@ export default function Home() {
     }
   };
 
+  const handleDeleteMapping = async (item: MappingMapSummary) => {
+    const targetName = item.name || item.mapDir || item.path || "该地图";
+    const confirmed = window.confirm(`确认删除地图“${targetName}”吗？该操作不可恢复。`);
+    if (!confirmed) {
+      return;
+    }
+
+    setMappingDeletingName(targetName);
+    setMappingActionStatus("submitting");
+    setMappingActionMessage(`正在删除地图 ${targetName}。`);
+
+    try {
+      const response = await fetch("/api/mapping/delete", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({
+          mapDir: item.mapDir || item.path || undefined,
+          mapName: item.name || undefined,
+        }),
+      });
+
+      const result = (await response.json()) as MappingDeleteResult;
+
+      if (!response.ok || !result.ok) {
+        throw new Error(result.error || `删除地图失败: HTTP ${response.status}`);
+      }
+
+      if ((result.errorCode ?? 0) !== 0) {
+        throw new Error(result.errorMessage || `删除地图返回错误码 ${formatHexCode(result.errorCode ?? 0)}`);
+      }
+
+      const deletedName = result.deletedMapDir || item.mapDir || item.path || item.name || targetName;
+      setMappingActionStatus("success");
+      setMappingActionMessage(`已删除地图 ${deletedName}。`);
+      setMappingRuntime((current) => ({
+        ...current,
+        maps: current.maps.filter((mapItem) => mapItem.mapDir !== item.mapDir),
+      }));
+    } catch (error) {
+      setMappingActionStatus("error");
+      setMappingActionMessage(error instanceof Error ? error.message : "删除地图失败");
+    } finally {
+      setMappingDeletingName("");
+    }
+  };
+
   const updateTaskPointType = (id: string, nextType: TaskPointType) => {
     setTaskPoints((current) =>
       reindexTaskPoints(
@@ -3314,7 +3373,7 @@ export default function Home() {
                 建图与地图
               </div>
               <div className="mt-2 text-sm text-slate-400">
-                已接入 `2200` 建图 UDP 网关，支持开始建图、停止保存、状态轮询和切换导航地图。
+                已接入 `2200` 建图 UDP 网关，支持开始建图、停止保存、状态轮询、切换导航地图和删除地图。
               </div>
 
               <div className="mt-4 inline-flex rounded-full border px-3 py-1.5 text-sm">
@@ -3431,8 +3490,8 @@ export default function Home() {
                     <div key={item.path || item.name} className="rounded-2xl border border-white/10 bg-white/[0.03] p-3">
                       <div className="flex items-start justify-between gap-3">
                         <div className="min-w-0">
-                          <div className="truncate font-medium text-white">{item.name || "-"}</div>
-                          <div className="mt-1 break-all text-xs text-slate-500">{item.path || "-"}</div>
+                          <div className="truncate font-medium text-white">{item.name || item.mapDir || "-"}</div>
+                          <div className="mt-1 break-all text-xs text-slate-500">{item.mapDir || item.path || "-"}</div>
                         </div>
                         <div className="rounded-full border border-white/10 px-2 py-1 text-xs text-slate-300">
                           {item.isActive ? "当前激活" : "待切换"}
@@ -3442,9 +3501,9 @@ export default function Home() {
                         <span>产物：{item.artifactsOk ? "完整" : "不完整"}</span>
                         <span>{item.mtime || "-"}</span>
                       </div>
-                      <div className="mt-3">
+                      <div className="mt-3 flex flex-wrap gap-2">
                         <ControlButton
-                          onClick={() => handleApplyMapping(item.name)}
+                          onClick={() => handleApplyMapping(item.mapDir || item.name)}
                           disabled={
                             mappingActionStatus === "submitting" ||
                             mappingRuntime.taskState === "running" ||
@@ -3452,7 +3511,20 @@ export default function Home() {
                             item.isActive
                           }
                         >
-                          {mappingApplyingName === item.name ? "切换中" : item.isActive ? "当前地图" : "切换到该地图"}
+                          {mappingApplyingName === (item.mapDir || item.name) ? "切换中" : item.isActive ? "当前地图" : "切换到该地图"}
+                        </ControlButton>
+                        <ControlButton
+                          onClick={() => handleDeleteMapping(item)}
+                          disabled={
+                            mappingActionStatus === "submitting" ||
+                            mappingRuntime.taskState === "running" ||
+                            mappingRuntime.taskState === "saving" ||
+                            item.isActive
+                          }
+                          className="border-rose-400/40 bg-rose-400/10 text-rose-100 hover:bg-rose-400/20"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                          {mappingDeletingName === (item.name || item.mapDir || item.path) ? "删除中" : item.isActive ? "当前地图不可删" : "删除地图"}
                         </ControlButton>
                       </div>
                     </div>

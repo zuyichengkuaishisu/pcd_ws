@@ -12,6 +12,7 @@ import { traeBadgePlugin } from 'vite-plugin-trae-solo-badge';
 import {
   applyNavigationMap,
   cancelNavigationTask,
+  deleteLocalMap,
   listLocalMaps,
   requestMappingStatus,
   requestRobotPose,
@@ -1360,6 +1361,47 @@ function createMappingApplyHandler(): ApiHandler {
   };
 }
 
+function createMappingDeleteHandler(): ApiHandler {
+  return async (req, res) => {
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+
+    if (req.method !== "POST") {
+      res.statusCode = 405;
+      res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
+      return;
+    }
+
+    try {
+      const body = await readJsonBody(req);
+      const mapName = typeof body.mapName === "string" ? body.mapName.trim() : "";
+      const mapDir = typeof body.mapDir === "string" ? body.mapDir.trim() : "";
+      if (!mapName && !mapDir) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ ok: false, error: "删除地图需要 mapName 或 mapDir" }));
+        return;
+      }
+
+      const response = await deleteLocalMap(MAPPING_HOST, MAPPING_PORT, {
+        mapName: mapName || undefined,
+        mapDir: mapDir || undefined,
+      });
+      res.statusCode = 200;
+      res.end(JSON.stringify({ ok: true, ...response }));
+    } catch (error) {
+      res.statusCode = 502;
+      res.end(
+        JSON.stringify({
+          ok: false,
+          error: error instanceof Error ? error.message : "删除地图失败",
+          host: MAPPING_HOST,
+          port: MAPPING_PORT,
+        }),
+      );
+    }
+  };
+}
+
 function robotPoseApiPlugin() {
   const poseHandler = createRobotPoseHandler();
   const posesHandler = createRobotPosesHandler();
@@ -1383,6 +1425,7 @@ function robotPoseApiPlugin() {
   const mappingStopHandler = createMappingStopHandler();
   const mappingListHandler = createMappingListHandler();
   const mappingApplyHandler = createMappingApplyHandler();
+  const mappingDeleteHandler = createMappingDeleteHandler();
 
   return {
     name: "robot-pose-api",
@@ -1406,6 +1449,7 @@ function robotPoseApiPlugin() {
       server.middlewares.use("/api/mapping/stop", mappingStopHandler);
       server.middlewares.use("/api/mapping/maps", mappingListHandler);
       server.middlewares.use("/api/mapping/apply", mappingApplyHandler);
+      server.middlewares.use("/api/mapping/delete", mappingDeleteHandler);
       server.middlewares.use("/api/map/pcd-files", pcdListHandler);
       server.middlewares.use("/api/map/pcd/", pcdHandler);
       server.middlewares.use("/api/map/occ-grid/meta", occGridMetaHandler);
@@ -1431,6 +1475,7 @@ function robotPoseApiPlugin() {
       server.middlewares.use("/api/mapping/stop", mappingStopHandler);
       server.middlewares.use("/api/mapping/maps", mappingListHandler);
       server.middlewares.use("/api/mapping/apply", mappingApplyHandler);
+      server.middlewares.use("/api/mapping/delete", mappingDeleteHandler);
       server.middlewares.use("/api/map/pcd-files", pcdListHandler);
       server.middlewares.use("/api/map/pcd/", pcdHandler);
       server.middlewares.use("/api/map/occ-grid/meta", occGridMetaHandler);

@@ -1,9 +1,9 @@
 # 云深处 M20 Onboard 建图 UDP 网关协议（拟定稿）
 
-> **状态**：拟定稿 v0.1（2026-06-15）  
-> **目的**：将 NOS 上云深处自带 SLAM 建图能力（`drmap` / `mapping.service`）封装为 UDP 接口，供上位机远程启停建图、查询状态、切换/打包地图。  
+> **状态**：拟定稿 v0.1.4（2026-06-26）  
+> **目的**：将 NOS 上云深处自带 SLAM 建图能力（`drmap` / `mapping.service`）封装为 UDP 接口，供上位机远程启停建图、查询状态、切换/删除地图。  
 > **适用设备**：M20 / M20 Pro 导航主机（NOS）  
-> **底层实现**：`/usr/local/bin/drmap`（参见 `onboard_slam_nav_flow.md`、`scripts/drmap_mapping.sh`）
+> **底层实现**：`/usr/local/bin/drmap`（参见 [onboard_slam_nav_flow.md](onboard_slam_nav_flow.md)、`scripts/drmap_mapping.sh`）
 
 ---
 
@@ -12,7 +12,7 @@
 | 协议 | 部署位置 | 默认地址 | 端口 | 职责 |
 |------|----------|----------|------|------|
 | 本体监控协议（PatrolDevice） | 运控板 | `10.21.31.103` | UDP `30000` / TCP `30001` | 运动、充电、§7.4 导航等 |
-| **本协议（SlamGateway）** | **导航主机 NOS** | **`10.21.31.106`**（实机） | **UDP `30100`** | **建图 / 地图管理** |
+| **本协议（SlamGateway）** | **导航主机 NOS** | **`10.21.33.106`**（示例） | **UDP `30100`** | **建图 / 地图管理** |
 
 设计原则：
 
@@ -36,13 +36,16 @@
 | 项目 | 默认值 | 备注 |
 |------|--------|------|
 | 协议 | UDP | 仅 UDP；建图为长任务，靠状态轮询 |
-| 服务端 IP | NOS 地址 | 当前实机 `10.21.31.106`，以现场为准 |
+| 服务端 IP | NOS 地址 | 示例 `10.21.33.106`，以现场为准 |
 | 服务端端口 | `30100` | 可配置 |
 | ASDU 格式 | JSON | `0x01` |
 | 编码 | UTF-8 | |
 | 单次请求超时（上位机） | `5 s` | 查询类 |
 | 停止建图超时（上位机） | `180 s` | `stop_mapping` 可能较久 |
+| 地图根目录 | `/var/opt/robot/data/maps/` | 固定；协议中 **不传绝对路径** |
 | 报文 ID | 小端 `uint16` | 请求自增；响应沿用请求 ID |
+
+**地图目录约定**：除 §5.1 开始建图请求中的 `MapName`（**名前缀**，对应 `drmap -n`）外，凡涉及已存在地图目录的字段（如 `ActiveMapDir`、`MapDir`、`DeletedMapDir`、`Maps[].MapDir`）均为 **目录名**（basename），不含父路径。网关内部拼完整路径：`/var/opt/robot/data/maps/<目录名>`。
 
 ### 2.3 APDU 结构
 
@@ -122,9 +125,14 @@ stateDiagram-v2
 | `2` | 停止建图并保存 | 请求/响应 | `drmap stop_mapping` |
 | `3` | 查询建图/地图状态 | 请求/响应 | `drmap_mapping.sh status` |
 | `4` | 切换导航地图 | 请求/响应 | `drmap apply <dir>` |
-| `5` | 打包备份地图 | — | **v0.1 未实现**（返回 `0xB00B`） |
+| `5` | 删除地图 | 请求/响应 | 删除 `/var/opt/robot/data/maps/<name>/` |
 | `6` | 列出本地地图 | 请求/响应 | 扫描 `/var/opt/robot/data/maps/` |
 | `7` | 取消建图（可选） | 请求/响应 | 等价 `stop_mapping` 或厂商扩展 |
+
+**实现对齐说明**
+
+- **NOS 下位机 UDP 网关**：`Command 1/2/3/4/5/6` 已实现
+- **当前上位机前端接入**：`Command 1/2/3/4/6` 已接入；`Command 5 删除地图` 由下位机支持，但前端页面入口尚未暴露
 
 ---
 
@@ -143,7 +151,7 @@ stateDiagram-v2
 
 | 参数 | 类型 | 必填 | 默认 | 说明 |
 |------|------|------|------|------|
-| `MapName` | string | 否 | 自动生成 | 地图名前缀，对应 `drmap mapping -n` |
+| `MapName` | string | 否 | 自动生成 | **地图名前缀**（非目录名），对应 `drmap mapping -n` |
 | `Headless` | bool | 否 | `true` | `true` → `-s` 不启 RViz（上位机远程推荐） |
 | `Outdoor` | bool | 否 | `false` | `true` → `-o` 室外模式 |
 | `ActivateAfterStop` | bool | 否 | `true` | `false` → `-b` 建完不立即用于导航 |
@@ -161,8 +169,7 @@ sudo drmap mapping [-n MapName] [-s] [-o] [-b]
 |------|------|------|
 | `ErrorCode` | int | `0` |
 | `TaskState` | string | `running` |
-| `ActiveMapDir` | string | 新建地图目录绝对路径 |
-| `MapName` | string | 实际地图目录名，如 `map-mysite-20260615-140000` |
+| `ActiveMapDir` | string | 新建地图目录名，如 `map-lab_floor1-20260615-140003` |
 
 **JSON 请求示例**
 
@@ -194,8 +201,7 @@ sudo drmap mapping [-n MapName] [-s] [-o] [-b]
       "ErrorCode": 0,
       "ErrorMessage": "ok",
       "TaskState": "running",
-      "ActiveMapDir": "/var/opt/robot/data/maps/map-lab_floor1-20260615-140003",
-      "MapName": "map-lab_floor1-20260615-140003"
+      "ActiveMapDir": "map-lab_floor1-20260615-140003"
     }
   }
 }
@@ -221,7 +227,7 @@ sudo drmap mapping [-n MapName] [-s] [-o] [-b]
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `TaskState` | string | `idle` |
-| `ActiveMapDir` | string | 保存后的地图目录 |
+| `ActiveMapDir` | string | 保存后的地图目录名 |
 | `Artifacts` | object | 产物摘要，见下 |
 
 `Artifacts` 结构：
@@ -256,18 +262,20 @@ sudo drmap mapping [-n MapName] [-s] [-o] [-b]
 | `MappingService` | string | `active` / `inactive` / `failed` |
 | `LocalizationService` | string | 同上 |
 | `RsdriverService` | string | 同上 |
-| `ActiveMapDir` | string | `readlink -f .../maps/active` |
-| `ActiveMapName` | string | 目录 basename |
+| `ActiveMapDir` | string | 当前 active 地图目录名 |
+| `ActiveMapName` | string | 可选，当前 active 地图显示名；上位机前端可优先读该字段 |
 | `ArtifactsOk` | bool | 当前 active 地图产物是否完整 |
 | `SlamProcess` | string | 可选，`slam_ddsnode` 进程摘要 |
+| `Artifacts` | object | 可选，当前 active 地图产物摘要，格式同 §5.2 |
 | `Maps` | array | `IncludeMapList=true` 时返回 |
 
 `Maps[]` 元素：
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `Name` | string | 地图目录名 |
-| `Path` | string | 绝对路径 |
+| `MapDir` | string | 地图目录名 |
+| `Name` | string | 可选，地图显示名；若无独立显示名，可与 `MapDir` 相同 |
+| `Path` | string | 可选，兼容字段；建议返回目录名 basename 或完整路径之一 |
 | `IsActive` | bool | 是否为当前 active |
 | `Mtime` | string | 目录修改时间 |
 | `ArtifactsOk` | bool | 产物是否完整 |
@@ -282,34 +290,70 @@ sudo drmap mapping [-n MapName] [-s] [-o] [-b]
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `MapDir` | string | 二选一 | 地图目录绝对路径 |
-| `MapName` | string | 二选一 | 目录 basename，网关拼 `/var/opt/robot/data/maps/<MapName>` |
+| `MapDir` | string | 否 | 推荐字段，地图目录名，如 `siteA-20260616-105321` |
+| `MapName` | string | 否 | 兼容字段；当前上位机桥接允许传入，NOS 可解析为目录名或显示名 |
 
-**网关行为**：`sudo drmap apply <MapDir>`
+约束：`MapDir` 与 `MapName` **至少提供一个**；若两者同时存在，建议 NOS 优先按 `MapDir` 处理。
 
-**响应 Items**：`ActiveMapDir`、`LocalizationService` 重启结果
+**网关行为**：`sudo drmap apply /var/opt/robot/data/maps/<MapDir>`
+
+**响应 Items**：`ActiveMapDir`（目录名）、`ActiveMapName`（可选）、`LocalizationService` 重启结果
+
+**当前上位机 HTTP 桥接**
+
+- `POST /api/mapping/apply`
+- JSON Body 示例：
+
+```json
+{
+  "mapDir": "siteA-20260616-105321"
+}
+```
+
+或：
+
+```json
+{
+  "mapName": "siteA-20260616-105321"
+}
+```
 
 ---
 
-### 5.5 打包备份地图 — Command `5`
+### 5.5 删除地图 — Command `5`
+
+> 当前 **NOS 下位机已实现**该命令；当前仓库中的上位机前端尚未提供 `/api/mapping/delete` HTTP 桥接与页面入口，但协议本身与下位机实现已具备删图能力。
+
+**前置条件**
+
+- `TaskState` 为 `idle`（非建图 / 保存中）
+- **不可**删除当前 `active` 指向的地图
+- 目标为 `/var/opt/robot/data/maps/` 下的地图目录
 
 **请求 Items**
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `MapDir` | string | 否 | 默认打包 active |
-| `OutputHint` | string | 否 | 上位机备注，网关可写入日志 |
+| `MapDir` | string | 是 | 地图目录名，如 `siteA-20260616-105321`；网关拼 `/var/opt/robot/data/maps/<MapDir>` |
 
-**网关行为**：`sudo drmap pack`（或指定目录的厂商扩展）
+**网关行为**：递归删除地图目录（`drmap` 无 delete 子命令，由网关执行 `shutil.rmtree`）
 
 **响应 Items**
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `PackPath` | string | 生成的 zip 路径 |
-| `PackBytes` | int | 文件大小 |
+| `DeletedMapDir` | string | 已删除的地图目录名 |
 
-> 大文件 **不建议** 经 UDP 传输；上位机通过 SFTP/SCP 拉取 `PackPath`。
+**常见错误**
+
+| ErrorCode | 说明 |
+|-----------|------|
+| `0xB007` | 地图不存在 |
+| `0xB008` | 建图 / 保存中 |
+| `0xB00D` | 不可删除 active 地图 |
+| `0xB00E` | 删除失败（权限 / 占用等） |
+
+> 删除为**不可恢复**操作；若地图已同步至平台服务器，需另行在远端清理。
 
 ---
 
@@ -323,6 +367,19 @@ sudo drmap mapping [-n MapName] [-s] [-o] [-b]
 | `SortBy` | string | `mtime_desc` | 排序方式 |
 
 **响应 Items**：`Maps` 数组（格式同 §5.3）
+
+**当前上位机 HTTP 桥接**
+
+- `GET /api/mapping/maps`
+- Query 参数：
+  - `limit=<int>`
+  - `sortBy=<string>`，默认 `mtime_desc`
+
+示例：
+
+```bash
+curl "http://localhost:4174/api/mapping/maps?limit=20&sortBy=mtime_desc"
+```
 
 ---
 
@@ -378,9 +435,9 @@ sequenceDiagram
     G-->>H: TaskState, ArtifactsOk
   end
 
-  H->>G: Command 5 打包
-  G->>D: sudo drmap pack
-  G-->>H: PackPath
+  H->>G: Command 5 删除 MapDir=old-site-20260616-105321
+  G->>G: shutil.rmtree（非 active）
+  G-->>H: DeletedMapDir
 ```
 
 ---
@@ -400,6 +457,8 @@ sequenceDiagram
 | `0xB008` | NAV_STACK_BUSY | 建图/切换中 localization 状态不允许 |
 | `0xB009` | SUDO_DENIED | 网关无 sudo 权限 |
 | `0xB00A` | TIMEOUT | 内部操作超时 |
+| `0xB00D` | MAP_IS_ACTIVE | 不可删除当前 active 地图 |
+| `0xB00E` | DELETE_FAILED | 删除目录失败 |
 | `0xB0FF` | INTERNAL_ERROR | 未分类错误 |
 
 ---
@@ -442,6 +501,22 @@ user ALL=(ALL) NOPASSWD: /usr/local/bin/drmap
 | `onboard_slam_nav_flow.md` | 架构与话题参考 |
 | `m20_robot_monitoring_protocol.md` | APDU 帧格式参考 |
 
+### 9.5 上下位机对齐情况
+
+当前地图管理能力分为两层：
+
+| 层级 | 组件 | 状态 |
+|------|------|------|
+| 下位机 NOS | `mapping_udp_gateway.py` / `test_mapping_udp_client.py` / `install_mapping_udp_gateway_service.sh` | `Command 1/2/3/4/5/6` 已实现 |
+| 上位机前端 | `web-pcd-viewer/api/m20RobotProtocol.ts` | `Command 1/2/3/4/6` 已接入 |
+| 上位机本地桥接 | `web-pcd-viewer/vite.config.ts` | `/api/mapping/start`、`/stop`、`/status`、`/maps`、`/apply` 已接入 |
+
+这意味着：
+
+- 通过 UDP 直连 NOS 时，开始/停止/查询/apply/list/delete 均可使用
+- 通过当前 Web 前端页面时，开始/停止/查询/apply/list 已接入
+- 若要在前端直接删图，只需补 `/api/mapping/delete` 桥接和页面入口，无需修改 NOS 协议
+
 ---
 
 ## 10. 安全与运维
@@ -473,7 +548,7 @@ def call(cmd: int, items: dict) -> dict:
         }
     }).encode()
     apdu, mid = build_apdu(asdu)
-    sock.sendto(apdu, ("10.21.31.106", 30100))
+    sock.sendto(apdu, ("10.21.33.106", 30100))
     data, _ = sock.recvfrom(65535)
     return parse_response(data)
 
@@ -503,7 +578,8 @@ while True:
 | 版本 | 日期 | 说明 |
 |------|------|------|
 | v0.1 | 2026-06-15 | 初稿：Type=2200，Command 1~6，对齐 drmap 与 drmap_mapping.sh |
-| v0.1.1 | 2026-06-15 | 网关实现；Command 5 打包暂缓 |
+| v0.1.3 | 2026-06-26 | 地图目录字段统一为 basename；根目录固定 `/var/opt/robot/data/maps/` |
+| v0.1.4 | 2026-06-26 | 对齐地图管理实现现状：NOS 已实现 Command 1~6；补充 ActiveMapName / Artifacts / Maps 扩展字段，apply/list 对齐当前上位机桥接 |
 
 ---
 
@@ -511,10 +587,13 @@ while True:
 
 | 组件 | 路径 | 状态 |
 |------|------|------|
-| UDP 网关 | `scripts/mapping_udp_gateway.py` | Command 1/2/3/4/6 已实现 |
+| UDP 网关 | `scripts/mapping_udp_gateway.py` | Command 1/2/3/4/5/6 已实现 |
 | 测试客户端 | `scripts/test_mapping_udp_client.py` | 已实现 |
-| 后台启动 | `scripts/mapping_udp_gateway_start.sh` | 已实现 |
-| 打包备份 Command 5 | — | **暂未实现**（返回 `0xB00B`） |
+| 服务安装脚本 | `scripts/install_mapping_udp_gateway_service.sh` | 已实现 |
+| 后台启动脚本 | `scripts/mapping_udp_gateway_start.sh` | 已实现 |
+| 上位机前端协议封装 | `web-pcd-viewer/api/m20RobotProtocol.ts` | `Command 1/2/3/4/6` 已接入 |
+| 上位机本地 HTTP 桥接 | `web-pcd-viewer/vite.config.ts` | `/api/mapping/start`、`/stop`、`/status`、`/maps`、`/apply` 已实现 |
+| 删除地图 Command `5` 前端入口 | 当前上位机前端 | 待补 UI / HTTP 桥接，NOS 已实现 |
 
 ### NOS 部署
 
@@ -522,7 +601,7 @@ while True:
 # drmap 无密码 sudo
 echo 'user ALL=(ALL) NOPASSWD: /usr/local/bin/drmap' | sudo tee /etc/sudoers.d/m20-mapping-gateway
 
-# 开机自启（systemd + NOS_start.sh）
+# 开机自启（systemd）
 sudo ~/m20_slam/scripts/install_mapping_udp_gateway_service.sh
 
 # 或仅手动后台
@@ -535,18 +614,20 @@ python3 ~/m20_slam/scripts/test_mapping_udp_client.py status
 ### 典型联调
 
 ```bash
-python3 ~/m20_slam/scripts/test_mapping_udp_client.py --host 10.21.31.106 status
-python3 ~/m20_slam/scripts/test_mapping_udp_client.py --host 10.21.31.106 start --name siteA
-python3 ~/m20_slam/scripts/test_mapping_udp_client.py --host 10.21.31.106 stop
-python3 ~/m20_slam/scripts/test_mapping_udp_client.py --host 10.21.31.106 wait-idle
+python3 ~/m20_slam/scripts/test_mapping_udp_client.py --host 10.21.33.106 status
+python3 ~/m20_slam/scripts/test_mapping_udp_client.py --host 10.21.33.106 start --name siteA
+python3 ~/m20_slam/scripts/test_mapping_udp_client.py --host 10.21.33.106 stop
+python3 ~/m20_slam/scripts/test_mapping_udp_client.py --host 10.21.33.106 wait-idle
 python3 ~/m20_slam/scripts/test_mapping_udp_client.py list
 python3 ~/m20_slam/scripts/test_mapping_udp_client.py apply \
-  --map-name map-20260611-170905 --timeout 120
+  --map-dir map-20260611-170905 --timeout 120
+python3 ~/m20_slam/scripts/test_mapping_udp_client.py delete \
+  --map-dir siteA-20260616-105321
 ```
 
 ### 待办
 
 - [ ] NOS 防火墙放行 UDP 30100
-- [ ] 实机联调：开始 → 扫描 → 停止 → apply
-- [ ] Command 5 打包备份（后续版本）
+- [ ] 上位机前端补 `/api/mapping/delete` 与删图 UI
+- [ ] 实机回归：开始 → 扫描 → 停止 → apply → delete（非 active）
 - [ ] 可选：建图进度经 Command 3 扩展
