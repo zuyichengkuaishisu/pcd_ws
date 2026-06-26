@@ -4,6 +4,7 @@
 
 web-pcd-viewer/node_modules/
 web-pcd-viewer/dist/
+data/maps/
 
 *.pyc
 __pycache__/

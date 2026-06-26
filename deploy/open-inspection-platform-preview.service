@@ -1,0 +1,20 @@
+[Unit]
+Description=Open Inspection Platform Preview (Local Build)
+Documentation=file://__PROJECT_DIR__/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+__RUN_USER_DIRECTIVE__
+__RUN_GROUP_DIRECTIVE__
+WorkingDirectory=__WEB_DIR__
+Environment=PATH=__NODE_BIN_DIR__:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStartPre=/usr/bin/bash -lc 'npm run build'
+ExecStart=/usr/bin/bash -lc 'npm run preview -- --host 0.0.0.0 --port __APP_PORT__'
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=300
+
+[Install]
+WantedBy=__WANTED_BY__
