@@ -4,7 +4,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { defineConfig } from 'vite'
+import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
 import tsconfigPaths from "vite-tsconfig-paths";
 import { traeBadgePlugin } from 'vite-plugin-trae-solo-badge';
@@ -30,12 +30,12 @@ import {
   type RobotMotionAction,
 } from "./api/m20RobotProtocol";
 
-const ROBOT_HOST = process.env.M20_ROBOT_HOST ?? "10.21.31.103";
-const ROBOT_PORT = Number(process.env.M20_ROBOT_PORT ?? "30001");
-const ROBOT_UDP_PORT = Number(process.env.M20_ROBOT_UDP_PORT ?? "30000");
-const MAPPING_HOST = process.env.M20_MAPPING_HOST ?? "10.21.33.106";
-const MAPPING_PORT = Number(process.env.M20_MAPPING_PORT ?? "30100");
-const AGENT_BASE_URL = (process.env.M20_AGENT_BASE_URL ?? "http://10.21.31.104:9900").replace(/\/+$/, "");
+let ROBOT_HOST = process.env.M20_ROBOT_HOST ?? "10.21.31.103";
+let ROBOT_PORT = Number(process.env.M20_ROBOT_PORT ?? "30001");
+let ROBOT_UDP_PORT = Number(process.env.M20_ROBOT_UDP_PORT ?? "30000");
+let MAPPING_HOST = process.env.M20_MAPPING_HOST ?? "10.21.33.106";
+let MAPPING_PORT = Number(process.env.M20_MAPPING_PORT ?? "30100");
+let AGENT_BASE_URL = (process.env.M20_AGENT_BASE_URL ?? "http://10.21.31.104:9900").replace(/\/+$/, "");
 const PROJECT_DIR = dirname(fileURLToPath(import.meta.url));
 const WORKSPACE_DIR = resolve(PROJECT_DIR, "..");
 const MAPS_DIR = process.env.M20_MAPS_DIR ? resolve(process.env.M20_MAPS_DIR) : resolve(WORKSPACE_DIR, "data/maps");
@@ -264,6 +264,48 @@ async function postAgentJson<TPayload extends Record<string, unknown>>(path: str
       Accept: "application/json",
     },
     body: JSON.stringify(payload),
+  });
+
+  const text = await response.text();
+  let data: unknown = null;
+  if (text) {
+    try {
+      data = JSON.parse(text) as unknown;
+    } catch {
+      data = text;
+    }
+  }
+
+  if (!response.ok) {
+    const errorMessage =
+      typeof data === "object" && data !== null && "message" in data && typeof (data as { message?: unknown }).message === "string"
+        ? (data as { message: string }).message
+        : `Agent 接口请求失败: HTTP ${response.status}`;
+    throw new Error(errorMessage);
+  }
+
+  return {
+    status: response.status,
+    data,
+  };
+}
+
+async function getAgentJson(path: string, query?: Record<string, string | number | boolean | undefined>) {
+  const url = new URL(`${AGENT_BASE_URL}${path}`);
+  if (query) {
+    for (const [key, value] of Object.entries(query)) {
+      if (value === undefined) {
+        continue;
+      }
+      url.searchParams.set(key, String(value));
+    }
+  }
+
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      Accept: "application/json",
+    },
   });
 
   const text = await response.text();
@@ -935,6 +977,42 @@ function createAgentPtzGotoHandler(): ApiHandler {
   };
 }
 
+function createAgentPtzPositionHandler(): ApiHandler {
+  return async (req, res) => {
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+
+    if (req.method !== "GET") {
+      res.statusCode = 405;
+      res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
+      return;
+    }
+
+    try {
+      const url = new URL(req.url ?? "", "http://localhost");
+      const channel = Number(url.searchParams.get("channel") ?? 1);
+      if (Number.isNaN(channel)) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ ok: false, error: "云台参数无效，需要 channel 数值" }));
+        return;
+      }
+
+      const result = await getAgentJson("/api/agent/hk/ptz/position", { channel });
+      res.statusCode = 200;
+      res.end(JSON.stringify({ ok: true, agentBaseUrl: AGENT_BASE_URL, ...result }));
+    } catch (error) {
+      res.statusCode = 502;
+      res.end(
+        JSON.stringify({
+          ok: false,
+          error: error instanceof Error ? error.message : "云台位置查询失败",
+          agentBaseUrl: AGENT_BASE_URL,
+        }),
+      );
+    }
+  };
+}
+
 function createAgentLightControlHandler(): ApiHandler {
   return async (req, res) => {
     res.setHeader("Content-Type", "application/json; charset=utf-8");
@@ -1294,6 +1372,7 @@ function robotPoseApiPlugin() {
   const robotSoftEstopHandler = createRobotSoftEstopHandler();
   const robotAxisControlHandler = createRobotAxisControlHandler();
   const agentPtzGotoHandler = createAgentPtzGotoHandler();
+  const agentPtzPositionHandler = createAgentPtzPositionHandler();
   const agentLightControlHandler = createAgentLightControlHandler();
   const occGridMetaHandler = createOccGridMetaHandler();
   const occGridImageHandler = createOccGridImageHandler();
@@ -1320,6 +1399,7 @@ function robotPoseApiPlugin() {
       server.middlewares.use("/api/robot/soft-estop", robotSoftEstopHandler);
       server.middlewares.use("/api/robot/axis-control", robotAxisControlHandler);
       server.middlewares.use("/api/agent/ptz/goto", agentPtzGotoHandler);
+      server.middlewares.use("/api/agent/ptz/position", agentPtzPositionHandler);
       server.middlewares.use("/api/agent/light/control", agentLightControlHandler);
       server.middlewares.use("/api/mapping/status", mappingStatusHandler);
       server.middlewares.use("/api/mapping/start", mappingStartHandler);
@@ -1344,6 +1424,7 @@ function robotPoseApiPlugin() {
       server.middlewares.use("/api/robot/soft-estop", robotSoftEstopHandler);
       server.middlewares.use("/api/robot/axis-control", robotAxisControlHandler);
       server.middlewares.use("/api/agent/ptz/goto", agentPtzGotoHandler);
+      server.middlewares.use("/api/agent/ptz/position", agentPtzPositionHandler);
       server.middlewares.use("/api/agent/light/control", agentLightControlHandler);
       server.middlewares.use("/api/mapping/status", mappingStatusHandler);
       server.middlewares.use("/api/mapping/start", mappingStartHandler);
@@ -1359,28 +1440,38 @@ function robotPoseApiPlugin() {
 }
 
 // https://vite.dev/config/
-export default defineConfig({
-  build: {
-    sourcemap: 'hidden',
-  },
-  plugins: [
-    react({
-      babel: {
-        plugins: [
-          'react-dev-locator',
-        ],
-      },
-    }),
-    traeBadgePlugin({
-      variant: 'dark',
-      position: 'bottom-right',
-      prodOnly: true,
-      clickable: true,
-      clickUrl: 'https://www.trae.ai/solo?showJoin=1',
-      autoTheme: true,
-      autoThemeTarget: '#root'
-    }), 
-    tsconfigPaths(),
-    robotPoseApiPlugin()
-  ],
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, process.cwd(), "");
+  ROBOT_HOST = env.M20_ROBOT_HOST || ROBOT_HOST;
+  ROBOT_PORT = Number(env.M20_ROBOT_PORT || ROBOT_PORT);
+  ROBOT_UDP_PORT = Number(env.M20_ROBOT_UDP_PORT || ROBOT_UDP_PORT);
+  MAPPING_HOST = env.M20_MAPPING_HOST || MAPPING_HOST;
+  MAPPING_PORT = Number(env.M20_MAPPING_PORT || MAPPING_PORT);
+  AGENT_BASE_URL = (env.M20_AGENT_BASE_URL || AGENT_BASE_URL).replace(/\/+$/, "");
+
+  return {
+    build: {
+      sourcemap: 'hidden',
+    },
+    plugins: [
+      react({
+        babel: {
+          plugins: [
+            'react-dev-locator',
+          ],
+        },
+      }),
+      traeBadgePlugin({
+        variant: 'dark',
+        position: 'bottom-right',
+        prodOnly: true,
+        clickable: true,
+        clickUrl: 'https://www.trae.ai/solo?showJoin=1',
+        autoTheme: true,
+        autoThemeTarget: '#root'
+      }),
+      tsconfigPaths(),
+      robotPoseApiPlugin()
+    ],
+  };
 })

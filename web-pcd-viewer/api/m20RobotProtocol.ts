@@ -242,9 +242,15 @@ function parsePoseResponse(payload: Buffer, host: string, port: number): RobotPo
     pitch: Number(items.Pitch),
     yaw: Number(items.Yaw),
   };
+  const invalidPoseField = Object.entries(pose).find(([, value]) => !Number.isFinite(value));
+  if (invalidPoseField) {
+    throw new Error(`定位响应字段无效: ${invalidPoseField[0]}`);
+  }
+
+  const location = Number(items.Location);
 
   return {
-    location: Number(items.Location),
+    location: Number.isFinite(location) ? location : -1,
     pose,
     timestamp: parsed.PatrolDevice?.Time ?? "",
     host,

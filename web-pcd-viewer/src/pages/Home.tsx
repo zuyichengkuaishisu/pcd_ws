@@ -66,6 +66,13 @@ const PTZ_ZOOM_RANGE = { min: 0, max: 37 } as const;
 const AGENT_PTZ_SUCCESS_CODE = 10000;
 const AGENT_LIGHT_SUCCESS_CODE = 10000;
 const DEFAULT_WARNING_DURATION_SECONDS = 10;
+const PTZ_POSITION_POLL_MS = 500;
+const PTZ_STABLE_FRAME_COUNT = 3;
+const PTZ_POST_STABLE_WAIT_MS = 3000;
+const PTZ_POSITION_TIMEOUT_MS = 30000;
+const PTZ_PAN_TOLERANCE = 1;
+const PTZ_TILT_TOLERANCE = 1;
+const PTZ_ZOOM_TOLERANCE = 0.1;
 
 function waitForMs(ms: number) {
   return new Promise<void>((resolve) => {
@@ -202,6 +209,14 @@ type TaskSchedulerState = {
   homeChargePending: boolean;
 };
 
+type PausedTaskSchedulerSnapshot = {
+  resumeIndex: number;
+  phase: TaskSchedulerPhase;
+  homeChargeIndex: number | null;
+  homeChargePending: boolean;
+  payloadCount: number;
+};
+
 type MappingMapSummary = {
   name: string;
   path: string;
@@ -223,6 +238,12 @@ type MappingRuntimeState = {
   artifactsOk: boolean;
   maps: MappingMapSummary[];
   timestamp: string;
+};
+
+type AgentPtzPosition = {
+  pan: number;
+  tilt: number;
+  zoom: number;
 };
 
 type SavedFloorSegment = {
@@ -378,7 +399,7 @@ export default function Home() {
   const [taskEditorEnabled, setTaskEditorEnabled] = useState(false);
   const [pendingTaskPointType, setPendingTaskPointType] = useState<TaskPointType>(1);
   const [taskPoints, setTaskPoints] = useState<TaskPoint[]>([]);
-  const [taskDispatchStatus, setTaskDispatchStatus] = useState<"idle" | "prepared" | "dispatching" | "error">("idle");
+  const [taskDispatchStatus, setTaskDispatchStatus] = useState<"idle" | "prepared" | "dispatching" | "paused" | "error">("idle");
   const [taskDispatchMessage, setTaskDispatchMessage] = useState("点击“编辑任务点”后，长按并拖动鼠标即可添加点位并标定方向。");
   const [floorSegmentationEnabled, setFloorSegmentationEnabled] = useState(false);
   const [floorSegmentationDraftRange, setFloorSegmentationDraftRange] = useState<{ minZ: number; maxZ: number } | null>(null);
@@ -458,6 +479,7 @@ export default function Home() {
     homeChargeIndex: null,
     homeChargePending: false,
   });
+  const [pausedTaskScheduler, setPausedTaskScheduler] = useState<PausedTaskSchedulerSnapshot | null>(null);
   const teleopPressedKeysRef = useRef(new Set<string>());
   const teleopSendingRef = useRef(false);
   const teleopLastSignatureRef = useRef(serializeTeleopAxisPayload(ZERO_TELEOP_AXIS_PAYLOAD));
@@ -717,9 +739,20 @@ export default function Home() {
     navigationPayloadsRef.current = navigationPayloads;
   }, [navigationPayloads]);
 
+  const isTaskDispatchLocked = taskDispatchStatus === "dispatching" || taskDispatchStatus === "paused";
+  const canInterruptNavigation =
+    taskDispatchStatus === "dispatching" &&
+    taskSchedulerState.active &&
+    !!taskSchedulerState.runId &&
+    taskSchedulerState.currentIndex >= 0 &&
+    taskSchedulerState.phase !== "idle";
+  const canResumeNavigation = taskDispatchStatus === "paused" && pausedTaskScheduler !== null;
+
   const taskDispatchTone =
     taskDispatchStatus === "dispatching"
       ? "border-cyan-300/40 bg-cyan-300/10 text-cyan-100"
+      : taskDispatchStatus === "paused"
+        ? "border-violet-300/40 bg-violet-300/10 text-violet-100"
       : taskDispatchStatus === "error"
         ? "border-rose-400/40 bg-rose-400/10 text-rose-100"
       : taskDispatchStatus === "prepared"
@@ -821,6 +854,7 @@ export default function Home() {
 
   const stopTaskScheduler = useCallback(
     (nextStatus: "idle" | "prepared" | "error", message: string) => {
+      setPausedTaskScheduler(null);
       setTaskSchedulerState({
         active: false,
         runId: null,
@@ -879,6 +913,89 @@ export default function Home() {
       );
     }
   }, []);
+
+  const queryAgentPtzPosition = useCallback(async (channel = 1) => {
+    const response = await fetch(`/api/agent/ptz/position?channel=${encodeURIComponent(String(channel))}`, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+      },
+    });
+
+    const result = (await response.json()) as {
+      ok: boolean;
+      error?: string;
+      data?: unknown;
+    };
+
+    if (!response.ok || !result.ok) {
+      throw new Error(result.error || `云台位置查询失败: HTTP ${response.status}`);
+    }
+
+    const businessCode = extractAgentBusinessCode(result.data);
+    if (businessCode !== null && businessCode !== AGENT_PTZ_SUCCESS_CODE) {
+      throw new Error(
+        formatAgentBusinessError(result.data, `云台位置返回业务码 ${businessCode ?? "未知"}，期望 ${AGENT_PTZ_SUCCESS_CODE}`),
+      );
+    }
+
+    if (!result.data || typeof result.data !== "object") {
+      throw new Error("云台位置返回格式无效。");
+    }
+
+    const record = result.data as Record<string, unknown>;
+    const positionSource =
+      record.data && typeof record.data === "object" ? (record.data as Record<string, unknown>) : record;
+    const position: AgentPtzPosition = {
+      pan: Number(positionSource.pan),
+      tilt: Number(positionSource.tilt),
+      zoom: Number(positionSource.zoom),
+    };
+
+    if ([position.pan, position.tilt, position.zoom].some((value) => Number.isNaN(value))) {
+      throw new Error("云台位置返回缺少 pan/tilt/zoom 数值。");
+    }
+
+    return position;
+  }, []);
+
+  const waitForAgentPtzStable = useCallback(
+    async (payload: { pan_angle: number; tilt_angle: number; zoom: number; channel?: number }, runId: string, pointLabel: string) => {
+      const expectedChannel = payload.channel ?? 1;
+      const startedAt = Date.now();
+      let stableFrames = 0;
+
+      while (Date.now() - startedAt < PTZ_POSITION_TIMEOUT_MS) {
+        if (taskSchedulerStateRef.current.runId !== runId) {
+          return;
+        }
+
+        const position = await queryAgentPtzPosition(expectedChannel);
+        const panMatched = Math.abs(position.pan - payload.pan_angle) <= PTZ_PAN_TOLERANCE;
+        const tiltMatched = Math.abs(position.tilt - payload.tilt_angle) <= PTZ_TILT_TOLERANCE;
+        const zoomMatched = Math.abs(position.zoom - payload.zoom) <= PTZ_ZOOM_TOLERANCE;
+
+        if (panMatched && tiltMatched && zoomMatched) {
+          stableFrames += 1;
+          if (stableFrames >= PTZ_STABLE_FRAME_COUNT) {
+            setTaskDispatchMessage(`${pointLabel} 云台已稳定到位，等待额外 3 秒完成拍摄。`);
+            await waitForMs(PTZ_POST_STABLE_WAIT_MS);
+            return;
+          }
+        } else {
+          stableFrames = 0;
+        }
+
+        setTaskDispatchMessage(
+          `${pointLabel} 云台移动中，目标 Pan=${payload.pan_angle} Tilt=${payload.tilt_angle} Zoom=${payload.zoom}，当前 Pan=${position.pan.toFixed(1)} Tilt=${position.tilt.toFixed(1)} Zoom=${position.zoom.toFixed(1)}。`,
+        );
+        await waitForMs(PTZ_POSITION_POLL_MS);
+      }
+
+      throw new Error(`${pointLabel} 云台到位等待超时。`);
+    },
+    [queryAgentPtzPosition],
+  );
 
   const submitAgentLightControl = useCallback(async (payload: { voice: boolean; light: boolean; times: number }) => {
     const response = await fetch("/api/agent/light/control", {
@@ -1494,6 +1611,9 @@ export default function Home() {
           error: error instanceof Error ? error.message : String(error),
         });
         // #endregion
+        if (taskSchedulerStateRef.current.runId !== runId) {
+          return;
+        }
         stopTaskScheduler("error", error instanceof Error ? error.message : `第 ${index + 1} 个点位下发失败。`);
       }
     },
@@ -1534,6 +1654,19 @@ export default function Home() {
             if (taskSchedulerStateRef.current.runId !== runId) {
               return;
             }
+            await waitForAgentPtzStable(
+              {
+                channel: 1,
+                pan_angle: item.panAngle,
+                tilt_angle: item.tiltAngle,
+                zoom: item.zoom,
+              },
+              runId,
+              pointLabel,
+            );
+            if (taskSchedulerStateRef.current.runId !== runId) {
+              return;
+            }
           }
         }
 
@@ -1553,6 +1686,10 @@ export default function Home() {
             light: actions.warning.light,
             times: actions.warning.times,
           });
+          setTaskDispatchMessage(
+            `${pointLabel} 报警灯接口返回成功，等待 ${actions.warning.times + 5} 秒完成声光动作。`,
+          );
+          await waitForMs((actions.warning.times + 5) * 1000);
           if (taskSchedulerStateRef.current.runId !== runId) {
             return;
           }
@@ -1610,10 +1747,13 @@ export default function Home() {
         setTaskDispatchMessage(`${pointLabel} 动作执行完成，准备前往下一个点。`);
         await dispatchTaskPoint(nextIndex, runId, homeChargeIndex, false);
       } catch (error) {
+        if (taskSchedulerStateRef.current.runId !== runId) {
+          return;
+        }
         stopTaskScheduler("error", error instanceof Error ? error.message : `第 ${index + 1} 个点位动作执行失败。`);
       }
     },
-    [dispatchTaskPoint, stopTaskScheduler, submitAgentLightControl, submitAgentPtzGoto],
+    [dispatchTaskPoint, stopTaskScheduler, submitAgentLightControl, submitAgentPtzGoto, waitForAgentPtzStable],
   );
 
   useEffect(() => {
@@ -1840,6 +1980,149 @@ export default function Home() {
     } catch (error) {
       setNavControlStatus("error");
       setNavControlMessage(error instanceof Error ? error.message : "取消导航任务失败");
+    }
+  };
+
+  const handleInterruptNavigationSequence = async () => {
+    if (!taskSchedulerStateRef.current.active || !taskSchedulerStateRef.current.runId || taskSchedulerStateRef.current.currentIndex < 0) {
+      setNavControlStatus("error");
+      setNavControlMessage("当前没有正在执行的逐点调度，无法中断。");
+      return;
+    }
+
+    const { currentIndex, phase, homeChargeIndex, homeChargePending } = taskSchedulerStateRef.current;
+    const point = taskPointsRef.current[currentIndex];
+    const payloadCount = navigationPayloadsRef.current.length;
+    if (payloadCount === 0) {
+      setNavControlStatus("error");
+      setNavControlMessage("当前无可继续的导航序列。");
+      return;
+    }
+
+    const isPointDone = point?.status === "done";
+    const hasNextPoint = currentIndex + 1 < payloadCount;
+    const resumeIndex = isPointDone && hasNextPoint ? currentIndex + 1 : currentIndex;
+    const resumePoint = taskPointsRef.current[resumeIndex];
+    const pointLabel = point?.label || `P${currentIndex + 1}`;
+    const resumeLabel = resumePoint?.label || `P${resumeIndex + 1}`;
+
+    if (isPointDone && !hasNextPoint) {
+      stopTaskScheduler("prepared", "当前任务点已完成且已到达最后一个点位，无需继续导航。");
+      return;
+    }
+
+    setPausedTaskScheduler({
+      resumeIndex,
+      phase,
+      homeChargeIndex,
+      homeChargePending,
+      payloadCount,
+    });
+
+    const nextSchedulerState: TaskSchedulerState = {
+      active: false,
+      runId: null,
+      currentIndex: -1,
+      phase: "idle",
+      navTimestampMarker: "",
+      homeChargeIndex: null,
+      homeChargePending: false,
+    };
+    taskSchedulerStateRef.current = nextSchedulerState;
+    setTaskSchedulerState(nextSchedulerState);
+    setTaskDispatchStatus("paused");
+    setTaskEditorEnabled(false);
+    setTaskPoints((current) => current.map((item) => (item.status === "running" ? { ...item, status: "queued" } : item)));
+
+    setNavControlStatus("submitting");
+    setNavControlMessage(`正在中断导航并保留进度（当前 ${pointLabel}）。`);
+    setTaskDispatchMessage(
+      resumeIndex === currentIndex
+        ? `逐点调度已暂停：${pointLabel} 尚未完成导航/动作，点击“继续导航”将从该点继续。`
+        : `逐点调度已暂停：${pointLabel} 已完成，点击“继续导航”将从 ${resumeLabel} 继续。`,
+    );
+
+    try {
+      const response = await fetch("/api/robot/navigation-task-cancel", {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+        },
+      });
+
+      const result = (await response.json()) as {
+        ok: boolean;
+        error?: string;
+        errorCode?: number;
+        timestamp?: string;
+      };
+
+      if (!response.ok || !result.ok) {
+        throw new Error(result.error || `中断导航失败: HTTP ${response.status}`);
+      }
+
+      if ((result.errorCode ?? 0) !== 0) {
+        throw new Error(`中断导航返回 ErrorCode=${result.errorCode}`);
+      }
+
+      setNavControlStatus("success");
+      setNavControlMessage(`已中断导航并保留进度，返回时间 ${result.timestamp || "-"}`);
+    } catch (error) {
+      setNavControlStatus("error");
+      setNavControlMessage(error instanceof Error ? error.message : "中断导航失败");
+      setTaskDispatchMessage("逐点调度已暂停，但导航取消指令下发失败，可再点一次“中断导航”或直接“取消导航/紧急停止”。");
+    }
+  };
+
+  const handleResumeNavigationSequence = async () => {
+    if (!pausedTaskScheduler) {
+      setNavControlStatus("error");
+      setNavControlMessage("当前没有可继续的中断记录。");
+      return;
+    }
+
+    const resumeIndex = pausedTaskScheduler.resumeIndex;
+    const payloadCount = navigationPayloadsRef.current.length;
+    if (payloadCount === 0 || payloadCount !== pausedTaskScheduler.payloadCount) {
+      setNavControlStatus("error");
+      setNavControlMessage("当前任务点已变化，无法继续之前的导航序列。");
+      return;
+    }
+
+    if (resumeIndex < 0 || resumeIndex >= payloadCount) {
+      setNavControlStatus("error");
+      setNavControlMessage("中断点位索引无效，无法继续导航。");
+      return;
+    }
+
+    const point = taskPointsRef.current[resumeIndex];
+    const pointLabel = point?.label || `P${resumeIndex + 1}`;
+
+    setNavControlStatus("success");
+    setNavControlMessage(`准备从 ${pointLabel} 继续逐点调度。`);
+    setTaskDispatchStatus("dispatching");
+    setTaskDispatchMessage(`正在恢复逐点调度：从 ${pointLabel} 继续下发导航。`);
+    setTaskEditorEnabled(false);
+    setPausedTaskScheduler(null);
+
+    try {
+      const runId = crypto.randomUUID();
+      const nextSchedulerState: TaskSchedulerState = {
+        active: true,
+        runId,
+        currentIndex: resumeIndex,
+        phase: "dispatching_point",
+        navTimestampMarker: navigationRuntimeRef.current.timestamp,
+        homeChargeIndex: pausedTaskScheduler.homeChargeIndex,
+        homeChargePending: pausedTaskScheduler.homeChargePending,
+      };
+      taskSchedulerStateRef.current = nextSchedulerState;
+      setTaskSchedulerState(nextSchedulerState);
+      setTaskStatusesForIndex(resumeIndex, pausedTaskScheduler.homeChargeIndex, pausedTaskScheduler.homeChargePending);
+      await dispatchTaskPoint(resumeIndex, runId, pausedTaskScheduler.homeChargeIndex, pausedTaskScheduler.homeChargePending);
+    } catch (error) {
+      const failedMessage = error instanceof Error ? error.message : "继续导航失败";
+      stopTaskScheduler("error", failedMessage);
     }
   };
 
@@ -2420,10 +2703,11 @@ export default function Home() {
   };
 
   const submitNavigationSequence = async () => {
-    if (navigationPayloads.length === 0 || taskDispatchStatus === "dispatching") {
+    if (navigationPayloads.length === 0 || isTaskDispatchLocked) {
       return;
     }
 
+    setPausedTaskScheduler(null);
     setTaskDispatchStatus("dispatching");
     setTaskDispatchMessage("正在启动逐点调度：每次只下发一个点，到点执行任务后再继续前往下一个点。");
     setTaskEditorEnabled(false);
@@ -2524,6 +2808,18 @@ export default function Home() {
             >
               <Hand className="h-4 w-4" />
               取消导航
+            </ControlButton>
+            <ControlButton
+              onClick={canResumeNavigation ? handleResumeNavigationSequence : handleInterruptNavigationSequence}
+              disabled={navControlStatus === "submitting" || (!canInterruptNavigation && !canResumeNavigation)}
+              className={
+                canResumeNavigation
+                  ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-100 hover:bg-emerald-400/20"
+                  : "border-violet-300/40 bg-violet-300/10 text-violet-100 hover:bg-violet-300/20"
+              }
+            >
+              <Hand className="h-4 w-4" />
+              {canResumeNavigation ? "继续导航" : "中断导航"}
             </ControlButton>
             <ControlButton
               onClick={handleSoftEstop}
@@ -3185,16 +3481,16 @@ export default function Home() {
                       return next;
                     });
                   }}
-                  disabled={taskDispatchStatus === "dispatching"}
+                  disabled={isTaskDispatchLocked}
                   className={taskEditorEnabled ? "border-cyan-300/40 bg-cyan-400/10 text-cyan-100 hover:bg-cyan-400/20" : undefined}
                 >
                   {taskEditorEnabled ? "结束编辑" : "编辑任务点"}
                 </ControlButton>
-                <ControlButton onClick={removeLastTaskPoint} disabled={taskPoints.length === 0 || taskDispatchStatus === "dispatching"}>
+                <ControlButton onClick={removeLastTaskPoint} disabled={taskPoints.length === 0 || isTaskDispatchLocked}>
                   <Trash2 className="h-4 w-4" />
                   删除最后一个
                 </ControlButton>
-                <ControlButton onClick={clearTaskPoints} disabled={taskPoints.length === 0 || taskDispatchStatus === "dispatching"}>
+                <ControlButton onClick={clearTaskPoints} disabled={taskPoints.length === 0 || isTaskDispatchLocked}>
                   清空点位
                 </ControlButton>
               </div>
@@ -3213,6 +3509,7 @@ export default function Home() {
                       className="rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
                       value={selectedRouteId}
                       onChange={(event) => loadSelectedRoute(event.target.value)}
+                      disabled={isTaskDispatchLocked}
                     >
                       <option value="">选择已保存路线</option>
                       {savedRoutes.map((route) => (
@@ -3243,7 +3540,7 @@ export default function Home() {
                   <div className="flex flex-wrap gap-2">
                     <ControlButton
                       onClick={() => routeImportInputRef.current?.click()}
-                        disabled={taskDispatchStatus === "dispatching"}
+                      disabled={isTaskDispatchLocked}
                       className="border-emerald-400/40 bg-emerald-400/10 text-emerald-100 hover:bg-emerald-400/20"
                     >
                       <Upload className="h-4 w-4" />
@@ -3291,6 +3588,7 @@ export default function Home() {
                 {taskDispatchStatus === "idle" && "等待编辑任务点"}
                 {taskDispatchStatus === "prepared" && "顺序任务已准备"}
                 {taskDispatchStatus === "dispatching" && "逐点调度执行中"}
+                {taskDispatchStatus === "paused" && "逐点调度已暂停"}
                 {taskDispatchStatus === "error" && "逐点调度异常"}
               </div>
               <div className="mt-3 rounded-2xl border border-white/10 bg-white/[0.03] p-3 text-sm text-slate-300">
@@ -3299,11 +3597,11 @@ export default function Home() {
               <div className="mt-3 flex flex-wrap gap-3">
                 <ControlButton
                   onClick={submitNavigationSequence}
-                  disabled={navigationPayloads.length === 0 || taskDispatchStatus === "dispatching"}
+                  disabled={navigationPayloads.length === 0 || isTaskDispatchLocked}
                   className="border-cyan-300/40 bg-cyan-400/10 text-cyan-100 hover:bg-cyan-400/20"
                 >
                   <Send className="h-4 w-4" />
-                  {taskDispatchStatus === "dispatching" ? "执行中" : "逐点执行路线"}
+                  {taskDispatchStatus === "dispatching" ? "执行中" : taskDispatchStatus === "paused" ? "已暂停" : "逐点执行路线"}
                 </ControlButton>
                 <ControlButton
                   onClick={() => exportRouteToPathJson()}
@@ -3351,7 +3649,7 @@ export default function Home() {
                           <select
                             className="rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
                             value={point.type}
-                            disabled={taskDispatchStatus === "dispatching"}
+                            disabled={isTaskDispatchLocked}
                             onChange={(event) => updateTaskPointType(point.id, Number(event.target.value) as TaskPointType)}
                           >
                             {TASK_POINT_TYPE_ORDER.map((type) => (
@@ -3363,7 +3661,7 @@ export default function Home() {
                           <button
                             type="button"
                             className="rounded-2xl border border-white/10 bg-white/[0.04] p-2 text-slate-300 transition hover:bg-white/[0.08]"
-                            disabled={taskDispatchStatus === "dispatching"}
+                            disabled={isTaskDispatchLocked}
                             onClick={() => removeTaskPoint(point.id)}
                             aria-label={`删除 ${point.label}`}
                           >
@@ -3377,7 +3675,7 @@ export default function Home() {
                           <select
                             className="mt-2 w-full rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
                             value={point.gait}
-                            disabled={taskDispatchStatus === "dispatching"}
+                            disabled={isTaskDispatchLocked}
                             onChange={(event) => updateTaskPointNavigationField(point.id, "gait", Number(event.target.value))}
                           >
                             {NAVIGATION_GAIT_OPTIONS.map((option) => (
@@ -3392,7 +3690,7 @@ export default function Home() {
                           <select
                             className="mt-2 w-full rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
                             value={point.speed}
-                            disabled={taskDispatchStatus === "dispatching"}
+                            disabled={isTaskDispatchLocked}
                             onChange={(event) => updateTaskPointNavigationField(point.id, "speed", Number(event.target.value))}
                           >
                             {NAVIGATION_SPEED_OPTIONS.map((option) => (
@@ -3407,7 +3705,7 @@ export default function Home() {
                           <select
                             className="mt-2 w-full rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
                             value={point.manner}
-                            disabled={taskDispatchStatus === "dispatching"}
+                            disabled={isTaskDispatchLocked}
                             onChange={(event) => updateTaskPointNavigationField(point.id, "manner", Number(event.target.value))}
                           >
                             {NAVIGATION_MANNER_OPTIONS.map((option) => (
@@ -3422,7 +3720,7 @@ export default function Home() {
                           <select
                             className="mt-2 w-full rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
                             value={point.obsMode}
-                            disabled={taskDispatchStatus === "dispatching"}
+                            disabled={isTaskDispatchLocked}
                             onChange={(event) => updateTaskPointNavigationField(point.id, "obsMode", Number(event.target.value))}
                           >
                             {NAVIGATION_OBS_MODE_OPTIONS.map((option) => (
@@ -3437,7 +3735,7 @@ export default function Home() {
                           <select
                             className="mt-2 w-full rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
                             value={point.navMode}
-                            disabled={taskDispatchStatus === "dispatching"}
+                            disabled={isTaskDispatchLocked}
                             onChange={(event) => updateTaskPointNavigationField(point.id, "navMode", Number(event.target.value))}
                           >
                             {NAVIGATION_MODE_OPTIONS.map((option) => (
@@ -3459,7 +3757,7 @@ export default function Home() {
                           <button
                             type="button"
                             className="inline-flex items-center gap-2 rounded-2xl border border-cyan-300/30 bg-cyan-400/10 px-3 py-2 text-xs text-cyan-100 transition hover:bg-cyan-400/20"
-                            disabled={taskDispatchStatus === "dispatching"}
+                            disabled={isTaskDispatchLocked}
                             onClick={() => addTaskPointCapture(point.id)}
                           >
                             <Plus className="h-3.5 w-3.5" />
@@ -3480,7 +3778,7 @@ export default function Home() {
                                   <button
                                     type="button"
                                     className="rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs text-slate-300 transition hover:bg-white/[0.08]"
-                                    disabled={taskDispatchStatus === "dispatching"}
+                                    disabled={isTaskDispatchLocked}
                                     onClick={() => removeTaskPointCapture(point.id, captureIndex)}
                                   >
                                     删除
@@ -3496,7 +3794,7 @@ export default function Home() {
                                       step="1"
                                       className="mt-2 w-full rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
                                       value={capture.panAngle}
-                                      disabled={taskDispatchStatus === "dispatching"}
+                                      disabled={isTaskDispatchLocked}
                                       onChange={(event) => updateTaskPointCaptureField(point.id, captureIndex, "panAngle", Number(event.target.value))}
                                     />
                                   </label>
@@ -3509,7 +3807,7 @@ export default function Home() {
                                       step="1"
                                       className="mt-2 w-full rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
                                       value={capture.tiltAngle}
-                                      disabled={taskDispatchStatus === "dispatching"}
+                                      disabled={isTaskDispatchLocked}
                                       onChange={(event) => updateTaskPointCaptureField(point.id, captureIndex, "tiltAngle", Number(event.target.value))}
                                     />
                                   </label>
@@ -3522,7 +3820,7 @@ export default function Home() {
                                       step="1"
                                       className="mt-2 w-full rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
                                       value={capture.zoom}
-                                      disabled={taskDispatchStatus === "dispatching"}
+                                      disabled={isTaskDispatchLocked}
                                       onChange={(event) => updateTaskPointCaptureField(point.id, captureIndex, "zoom", Number(event.target.value))}
                                     />
                                   </label>
@@ -3543,7 +3841,7 @@ export default function Home() {
                                 type="checkbox"
                                 className="h-4 w-4 rounded border-white/20 bg-white/10"
                                 checked={Boolean(point.actionPreset.warning)}
-                                disabled={taskDispatchStatus === "dispatching"}
+                                disabled={isTaskDispatchLocked}
                                 onChange={(event) => setTaskPointWarningEnabled(point.id, event.target.checked)}
                               />
                               启用报警
@@ -3557,7 +3855,7 @@ export default function Home() {
                                   type="checkbox"
                                   className="h-4 w-4 rounded border-white/20 bg-white/10"
                                   checked={point.actionPreset.warning.voice}
-                                  disabled={taskDispatchStatus === "dispatching"}
+                                  disabled={isTaskDispatchLocked}
                                   onChange={(event) => updateTaskPointWarningField(point.id, "voice", event.target.checked)}
                                 />
                                 语音
@@ -3567,7 +3865,7 @@ export default function Home() {
                                   type="checkbox"
                                   className="h-4 w-4 rounded border-white/20 bg-white/10"
                                   checked={point.actionPreset.warning.light}
-                                  disabled={taskDispatchStatus === "dispatching"}
+                                  disabled={isTaskDispatchLocked}
                                   onChange={(event) => updateTaskPointWarningField(point.id, "light", event.target.checked)}
                                 />
                                 灯光
@@ -3580,7 +3878,7 @@ export default function Home() {
                                   step="1"
                                   className="mt-2 w-full rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
                                   value={point.actionPreset.warning.times}
-                                  disabled={taskDispatchStatus === "dispatching"}
+                                  disabled={isTaskDispatchLocked}
                                   onChange={(event) => updateTaskPointWarningField(point.id, "times", Number(event.target.value))}
                                 />
                                 <div className="mt-2 text-[11px] text-slate-500">
@@ -3623,8 +3921,8 @@ export default function Home() {
                         </div>
                         <div className="text-slate-500">Value={payload.Value}</div>
                       </div>
-                      <div>Pos=({payload.PosX.toFixed(3)}, {payload.PosY.toFixed(3)}, {payload.PosZ.toFixed(3)})</div>
-                      <div>Yaw={payload.AngleYaw.toFixed(3)} rad | PointInfo={payload.PointInfo}</div>
+                      <div>Pos=({Number(payload.PosX ?? 0).toFixed(3)}, {Number(payload.PosY ?? 0).toFixed(3)}, {Number(payload.PosZ ?? 0).toFixed(3)})</div>
+                      <div>Yaw={Number(payload.AngleYaw ?? 0).toFixed(3)} rad | PointInfo={payload.PointInfo}</div>
                       <div>Gait={payload.Gait} | Speed={payload.Speed} | Manner={payload.Manner}</div>
                       <div>ObsMode={payload.ObsMode} | NavMode={payload.NavMode}</div>
                     </div>
@@ -3760,6 +4058,7 @@ export default function Home() {
                 <div className="text-[11px] uppercase tracking-[0.25em] text-fuchsia-100">动作状态</div>
                 <div className={`mt-2 inline-flex rounded-full border px-2.5 py-1 text-xs ${taskDispatchTone}`}>
                   {taskDispatchStatus === "dispatching" && "路线执行中"}
+                  {taskDispatchStatus === "paused" && "路线已暂停"}
                   {taskDispatchStatus === "prepared" && "路线执行完成"}
                   {taskDispatchStatus === "error" && "路线执行异常"}
                   {taskDispatchStatus === "idle" && "等待执行"}
